@@ -38,6 +38,9 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
 ## 🛠 Dependencies
 - [`ffmpeg`](https://www.youtube.com/watch?v=JR36oH35Fgg) (required for audio extraction)
 
+## ©️ Credits
+Huge thanks to **[spiritascend](https://github.com/spiritascend)** for creating **[blurlconvert](https://github.com/spiritascend/blurlconvert/tree/main)** and thanks to him this software exists.
+
 ## 📜 License
 This project is **open-source** and licensed under the **MIT License**.
 
