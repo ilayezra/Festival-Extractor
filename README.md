@@ -36,7 +36,7 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
   - **Single File** – Merges all channels into one master file  
 
 ## 🛠 Dependencies
-- `ffmpeg` (required for audio extraction)
+- [`ffmpeg`](https://www.youtube.com/watch?v=JR36oH35Fgg) (required for audio extraction)
 
 ## 📜 License
 This project is **open-source** and licensed under the **MIT License**.
@@ -45,4 +45,4 @@ This project is **open-source** and licensed under the **MIT License**.
 Feel free to **fork this project** and submit a pull request if you have improvements!
 
 ## 📧 Contact
-For issues or feedback, open an **[Issue](https://github.com/ilayezra/Festival-Extractor/issues)** or reach out via email: `ilayezra37@gmail.com`
+For issues or feedback, open an **[Issue](https://github.com/ilayezra/Festival-Extractor/issues)** or reach out via **[Discord](https://discord.com/users/532594707692519425)**
