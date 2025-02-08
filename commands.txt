@@ -1,0 +1,12 @@
+stereo extracting
+
+ffmpeg -i master_audio.mp4 -map_channel 0.0.0 -map_channel 0.0.1 -ac 2 Drums.wav -i master_audio.mp4 -map_channel 0.0.2 -map_channel 0.0.3 -ac 2 Bass.wav -i master_audio.mp4 -map_channel 0.0.4 -map_channel 0.0.5 -ac 2 Lead.wav -i master_audio.mp4 -map_channel 0.0.6 -map_channel 0.0.7 -ac 2 Vocals.wav -i master_audio.mp4 -map_channel 0.0.8 -map_channel 0.0.9 -ac 2 Other.wav
+
+mono extracting
+
+ffmpeg -i master_audio.mp4 -map_channel 0.0.0 -ac 2 Drums_Left.wav -i master_audio.mp4 -map_channel 0.0.1 -ac 2 Drums_Right.wav -i master_audio.mp4 -map_channel 0.0.2 -ac 2 Bass_Left.wav -i master_audio.mp4 -map_channel 0.0.3 -ac 2 Bass_Right.wav -i master_audio.mp4 -map_channel 0.0.4 -ac 2 Lead_Left.wav -i master_audio.mp4 -map_channel 0.0.5 -ac 2 Lead_Right.wav -i master_audio.mp4 -map_channel 0.0.6 -ac 2 Vocals_Left.wav -i master_audio.mp4 -map_channel 0.0.7 -ac 2 Vocals_Right.wav -i master_audio.mp4 -map_channel 0.0.8 -ac 2 Other_Left.wav -i master_audio.mp4 -map_channel 0.0.9 -ac 2 Other_Right.wav
+
+one file extracting
+
+ffmpeg -i master_audio.mp4 -filter_complex "[0:a]pan=stereo|c0<c0+c2+c4+c6+c8|c1<c1+c3+c5+c7+c9[out]" -map "[out]" master.wav
+
