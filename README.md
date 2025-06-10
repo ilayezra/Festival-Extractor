@@ -18,7 +18,7 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
 
 ### Windows
 1. Download the latest **[Release](https://github.com/ilayezra/Festival-Extractor/releases)**
-2. Run `Festival Extractor.exe`
+2. Run `Festival Extractor`
 
 ## 🎛 Usage
 1. Launch **Fortnite Festival Extractor**
@@ -29,17 +29,15 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
 
 ## ⚙️ Settings
 - **Sorting Options**: Sort tracks by name, artist, or last added  
+- **Custom Naming**: you can choose if you want more details in your files name
 - **Audio Format**: Export files as `wav`, `mp3`, or `flac`  
 - **Extraction Mode**:  
   - **Stereo** (default) – Keeps left & right channels together  
   - **Mono** – Extracts individual channels separately  
-  - **Single File** – Merges all channels into one master file  
-
-## 🛠 Dependencies
-- [`ffmpeg`](https://www.youtube.com/watch?v=JR36oH35Fgg) (required for audio extraction)
+  - **Single File** – Merges all channels into one master file
 
 ## ©️ Credits
-Huge thanks to **[spiritascend](https://github.com/spiritascend)** for creating **[blurlconvert](https://github.com/spiritascend/blurlconvert/tree/main)** and thanks to him this software exists.
+Huge thanks to **[spiritascend](https://github.com/spiritascend)** for creating **[blurlconvert](https://github.com/spiritascend/blurlconvert/tree/main)**. thanks to his algorhythm this program exist
 
 ## 📜 License
 This project is **open-source** and licensed under the **MIT License**.
