@@ -184,11 +184,12 @@ class SmartPreviewSystem:
             ffmpeg_path = getattr(self.parent_app, 'ffmpeg_path', 'ffmpeg')
             
             # Convert to WAV
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             subprocess.run([
                 ffmpeg_path, '-y', '-i', temp_mp3_file, 
                 '-acodec', 'pcm_s16le', '-ar', '22050', '-ac', '2',
                 temp_wav_file
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
             
             # Clean up the MP3 file
             os.remove(temp_mp3_file)
@@ -1086,10 +1087,11 @@ class FortniteTracksGUI:
             self.update_progress(75)
 
             if key_hex:
+                creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 subprocess.run([
                     self.ffmpeg_path, '-y', '-decryption_key', key_hex,
                     '-i', output_path, '-c', 'copy', 'master_audio.mp4'
-                ], check=True)
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
             else:
                 os.rename(output_path, 'master_audio.mp4')
 
@@ -1571,28 +1573,34 @@ class FortniteTracksGUI:
         for detail in details:
             ttk.Label(self.song_info_frame, text=detail).pack(anchor="w", pady=2)
         
-        # Add to queue button
-        if self.is_song_in_queue(song):
-            add_button = ttk.Button(self.song_info_frame, text="Already in Queue", state="disabled")
+        # Check if FFmpeg is ready before showing buttons
+        if not self.ffmpeg_ready:
+            self.show_ffmpeg_loading_message()
         else:
-            add_button = ttk.Button(self.song_info_frame, text="Add to Queue", command=lambda: self.add_to_queue(song))
-        add_button.pack(pady=10)
+            # Add to queue button
+            if self.is_song_in_queue(song):
+                add_button = ttk.Button(self.song_info_frame, text="Already in Queue", state="disabled")
+            else:
+                add_button = ttk.Button(self.song_info_frame, text="Add to Queue", command=lambda: self.add_to_queue(song))
+            add_button.pack(pady=10)
         
-        # Check if this is an Epic Games song
-        if self.is_epic_games_song(song['artist']):
-            # Show Epic Games message
-            epic_label = ttk.Label(self.song_info_frame, text="Preview not available for Epic Games original tracks", 
-                                font=("Arial", 9), foreground="gray")
-            epic_label.pack(pady=(10, 0))
-        else:
-            # Single toggle button (centered like Add to Queue)
-            self.preview_button = ttk.Button(self.song_info_frame, text="▶ Play Preview", 
-                                            command=lambda: self.toggle_preview(song))
-            self.preview_button.pack(pady=(10, 0))
+        # Only show preview button if FFmpeg is ready
+        if self.ffmpeg_ready:
+                # Check if this is an Epic Games song
+            if self.is_epic_games_song(song['artist']):
+                    # Show Epic Games message
+                epic_label = ttk.Label(self.song_info_frame, text="Preview not available for Epic Games original tracks", 
+                                        font=("Arial", 9), foreground="gray")
+                epic_label.pack(pady=(10, 0))
+            else:
+                    # Single toggle button (centered like Add to Queue)
+                self.preview_button = ttk.Button(self.song_info_frame, text="▶ Play Preview", 
+                                                    command=lambda: self.toggle_preview(song))
+                self.preview_button.pack(pady=(10, 0))
 
-            # Preview status label (below button, centered)
-            self.preview_status = ttk.Label(self.song_info_frame, text="", font=("Arial", 9))
-            self.preview_status.pack(pady=(2, 0))
+                    # Preview status label (below button, centered)
+                self.preview_status = ttk.Label(self.song_info_frame, text="", font=("Arial", 9))
+                self.preview_status.pack(pady=(2, 0))
 
     def update_song_info_display(self):
         """Update the song info display to refresh button state"""
@@ -1600,6 +1608,18 @@ class FortniteTracksGUI:
         if selection:
             selected_song = self.filtered_songs[selection[0]]
             self.display_song_info(selected_song)
+
+    def show_ffmpeg_loading_message(self):
+        """Show loading message when FFmpeg is not ready"""
+        loading_frame = ttk.Frame(self.song_info_frame)
+        loading_frame.pack(pady=(20, 10))
+        
+        ttk.Label(loading_frame, text="⏳ Setting up audio tools...", 
+                font=("Arial", 11, "bold")).pack()
+        ttk.Label(loading_frame, text="Please wait while we download required components.", 
+                font=("Arial", 9)).pack()
+        ttk.Label(loading_frame, text="This only happens on first run.", 
+                font=("Arial", 9), foreground="gray").pack()
 
     def sanitize_folder_name(self, name):
         return re.sub(r'[<>:"/\\|?*]', '', name)
