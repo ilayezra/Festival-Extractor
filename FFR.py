@@ -557,15 +557,17 @@ class FortniteTracksGUI:
 
     def is_epic_games_song(self, artist):
         """Check if song is made by Epic Games"""
-        epic_indicators = [
+        # Clean the artist name and check for exact match
+        clean_artist = re.sub(r'[^\w\s]', '', artist.strip().lower())
+        clean_artist = re.sub(r'\s+', ' ', clean_artist).strip()
+        
+        # Only block previews for songs where the artist is literally "Epic Games"
+        epic_variants = [
             "epic games",
-            "fortnite",
-            "epic",
-            "original soundtrack",
-            "ost"
+            "epicgames"
         ]
-        artist_lower = artist.lower()
-        return any(indicator in artist_lower for indicator in epic_indicators)
+        
+        return clean_artist in epic_variants
 
     def delete_all_wav_files(self):
         """Delete all WAV files with 'temp' in the name when program closes"""
@@ -958,8 +960,9 @@ class FortniteTracksGUI:
         if match:
             total_seconds = float(match.group(1))
             segment_length = duration / timescale
-            return int(total_seconds / segment_length + 0.5)
-        return 100
+            estimated_count = int(total_seconds / segment_length + 0.5)
+            return estimated_count
+        return 100  # Keep reasonable fallback
 
     def find_actual_segment_count(self, base_url, seg_info, mpd_xml):
         print("Finding actual segment count...")
@@ -968,7 +971,137 @@ class FortniteTracksGUI:
         estimated_count = self.estimate_segment_count(mpd_xml, seg_info['duration'], seg_info['timescale'])
         print(f"MPD estimate: {estimated_count} segments")
         
-        # Test the estimated last segment
+        # Always be aggressive - check well beyond the estimate
+        # Use a smart exponential search to find the upper bound quickly
+        return self.exponential_then_binary_search(base_url, seg_info, estimated_count)
+
+    def exponential_then_binary_search(self, base_url, seg_info, estimated_count):
+        """Use exponential search to find upper bound, then binary search for exact count"""
+        
+        # Step 1: Start from the estimate and expand exponentially to find upper bound
+        print("Phase 1: Finding upper bound with exponential search...")
+        
+        # Always start checking from at least the estimate
+        current = estimated_count
+        last_valid = estimated_count
+        step_size = 10  # Start with steps of 10
+        
+        # First, verify our starting point (the estimate) actually works
+        test_seg_num = seg_info['start_number'] + current - 1
+        test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
+        
+        try:
+            test_response = requests.head(test_url, timeout=4)
+            if test_response.status_code == 200:
+                last_valid = current
+                print(f"Estimate segment {test_seg_num} exists")
+            else:
+                print(f"Estimate segment {test_seg_num} doesn't exist, searching backwards first...")
+                # If estimate doesn't work, binary search downward
+                return self.binary_search_segments(base_url, seg_info, 1, estimated_count - 1)
+        except:
+            print(f"Failed to check estimate segment, searching backwards...")
+            return self.binary_search_segments(base_url, seg_info, 1, estimated_count - 1)
+        
+        # Step 2: Exponential search upward to find where segments stop existing
+        max_checks = 15  # Limit exponential checks to prevent too much delay
+        checks_done = 0
+        
+        while checks_done < max_checks:
+            current += step_size
+            test_seg_num = seg_info['start_number'] + current - 1
+            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
+            
+            try:
+                test_response = requests.head(test_url, timeout=3)
+                if test_response.status_code == 200:
+                    last_valid = current
+                    print(f"Segment {test_seg_num} exists, expanding search...")
+                    step_size = min(step_size * 2, 50)  # Exponentially increase step, but cap at 50
+                else:
+                    print(f"Segment {test_seg_num} doesn't exist, found upper bound around {current}")
+                    break
+            except:
+                print(f"Failed to check segment {test_seg_num}, found upper bound around {current}")
+                break
+                
+            checks_done += 1
+        
+        # If we hit max_checks, we might have a very long song
+        if checks_done >= max_checks:
+            print(f"Hit maximum exponential checks, using upper bound of {current}")
+        
+        # Step 3: Binary search between last_valid and current for exact count
+        print(f"Phase 2: Binary search between {last_valid} and {current}")
+        final_count = self.binary_search_segments(base_url, seg_info, last_valid, current)
+        
+        # Step 4: Final verification - check a few segments after our result
+        print("Phase 3: Final verification...")
+        verified_count = self.verify_and_extend(base_url, seg_info, final_count)
+        
+        return verified_count
+
+    def verify_and_extend(self, base_url, seg_info, found_count):
+        """Verify the found count and check a few more segments just to be sure"""
+        
+        # Check the found segment exists
+        test_seg_num = seg_info['start_number'] + found_count - 1
+        test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
+        
+        try:
+            test_response = requests.head(test_url, timeout=4)
+            if test_response.status_code != 200:
+                print(f"Warning: Found count {found_count} segment doesn't exist!")
+                return found_count - 1
+        except:
+            print(f"Warning: Cannot verify found count {found_count}")
+            return found_count - 1
+        
+        # Check 5 more segments beyond our found count to be absolutely sure
+        for extra in range(1, 6):
+            test_seg_num = seg_info['start_number'] + found_count + extra - 1
+            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
+            
+            try:
+                test_response = requests.head(test_url, timeout=3)
+                if test_response.status_code == 200:
+                    found_count += 1
+                    print(f"Found additional segment {test_seg_num}, new count: {found_count}")
+                else:
+                    break
+            except:
+                break
+        
+        print(f"Final verified segment count: {found_count}")
+        return found_count
+    
+    def aggressive_search_from_high(self, base_url, seg_info, start_estimate):
+        """Start from a high estimate and work backwards to find the true end"""
+        print(f"Starting aggressive search from segment {start_estimate}")
+        
+        # First, find a reasonable upper bound by going even higher
+        upper_bound = start_estimate
+        while upper_bound < start_estimate + 100:  # Limit to prevent infinite searching
+            test_seg_num = seg_info['start_number'] + upper_bound - 1
+            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
+            
+            try:
+                test_response = requests.head(test_url, timeout=4)
+                if test_response.status_code == 200:
+                    print(f"Segment {test_seg_num} exists, expanding search...")
+                    upper_bound += 20  # Jump by larger chunks
+                else:
+                    print(f"Found upper bound at segment {upper_bound}")
+                    break
+            except:
+                print(f"Found upper bound at segment {upper_bound}")
+                break
+        
+        # Now binary search between start_estimate and upper_bound
+        return self.binary_search_segments(base_url, seg_info, start_estimate, upper_bound)
+    
+    def standard_segment_search(self, base_url, seg_info, estimated_count):
+        """Standard search for songs under 3:58"""
         test_seg_num = seg_info['start_number'] + estimated_count - 1
         test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
         
@@ -977,7 +1110,7 @@ class FortniteTracksGUI:
             if test_response.status_code == 200:
                 # Estimate was correct or too low, check a few more
                 print(f"Segment {test_seg_num} exists, checking for additional segments...")
-                for extra in range(1, 20):
+                for extra in range(1, 21):  # Check up to 20 more
                     test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num + extra))
                     try:
                         test_response = requests.head(test_url, timeout=3)
@@ -989,26 +1122,42 @@ class FortniteTracksGUI:
                         final_count = estimated_count + extra - 1
                         print(f"Found actual segment count: {final_count}")
                         return final_count
-                # If we get here, use estimate + checked extras
-                return estimated_count + 19
+                # If all 20 extra segments exist, there might be more
+                return estimated_count + 20
             else:
-                # Estimate was too high, find the actual last segment
+                # Estimate was too high, binary search downward
                 print(f"Segment {test_seg_num} doesn't exist, searching backwards...")
-                for i in range(estimated_count - 1, 0, -1):
-                    test_url = base_url + seg_info['media'].replace('$Number$', str(seg_info['start_number'] + i - 1))
-                    try:
-                        test_response = requests.head(test_url, timeout=3)
-                        if test_response.status_code == 200:
-                            final_count = i
-                            print(f"Found actual segment count: {final_count}")
-                            return final_count
-                    except:
-                        continue
+                return self.binary_search_segments(base_url, seg_info, 1, estimated_count)
+                
         except Exception as e:
             print(f"Error testing segments: {e}")
+            return estimated_count
+
+    def binary_search_segments(self, base_url, seg_info, low_count, high_count):
+        """Efficiently find the actual segment count using binary search"""
+        print(f"Binary searching segments between {low_count} and {high_count}")
         
-        print(f"Using MPD estimate: {estimated_count}")
-        return estimated_count
+        low = low_count
+        high = high_count
+        last_valid = low_count
+        
+        while low <= high:
+            mid = (low + high) // 2
+            test_seg_num = seg_info['start_number'] + mid - 1
+            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
+            
+            try:
+                test_response = requests.head(test_url, timeout=4)
+                if test_response.status_code == 200:
+                    last_valid = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            except:
+                high = mid - 1
+        
+        print(f"Binary search found segment count: {last_valid}")
+        return last_valid
 
     def convert_blurl_to_mp4(self, blurl_file, total_segments):
         try:
@@ -1046,6 +1195,7 @@ class FortniteTracksGUI:
             
             # Find actual segment count
             actual_count = self.find_actual_segment_count(base_url, seg_info, mpd_xml)
+            # Verify the count is accurate
             seg_info['segment_count'] = actual_count
             print(f"Will download {seg_info['segment_count']} segments.")
 
