@@ -1,0 +1,7 @@
+requests
+pillow
+pycryptodome
+pygame
+sv-ttk
+av
+numpy

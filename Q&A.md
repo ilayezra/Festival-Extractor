@@ -1,9 +1,8 @@
 
 # Festival Extractor Q&A
 
-### I get an error saying I don't have ffmpeg, how can I install it?
-You need to download ffmpeg and add it to path <br />
-Please watch [this youtube video](https://www.youtube.com/watch?v=JR36oH35Fgg) which best explains in depth how to install it properly.
+### Do I need to install ffmpeg?
+No. Everything the program needs (audio processing, decryption keys, icons) is built into `Festival Extractor.exe`.
 
 ### what's the difference between every file saving format?
 

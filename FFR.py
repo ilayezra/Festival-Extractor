@@ -17,14 +17,8 @@ import hashlib
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
 from Crypto.Cipher import AES
-import shutil
 import threading
 import queue
-import platform
-import urllib.request
-import zipfile
-import tarfile
-import stat
 os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 import pygame
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -32,8 +26,37 @@ from concurrent.futures import ThreadPoolExecutor
 import struct
 import math
 import time
-import random
+import tempfile
+import av
+import numpy as np
 from requests.adapters import HTTPAdapter
+
+STEM_NAMES = ["Drums", "Bass", "Lead", "Vocals", "Other"]
+AUDIO_CODECS = {"wav": "pcm_s16le", "flac": "flac", "mp3": "libmp3lame"}
+
+
+def resource_path(name):
+    """Find a file bundled with the program: inside the exe when frozen, else next to the script (or in media/, alpha/)"""
+    if getattr(sys, 'frozen', False):
+        return os.path.join(sys._MEIPASS, name)
+    base = os.path.dirname(os.path.abspath(__file__))
+    for folder in (base, os.path.join(base, 'media'), os.path.join(base, 'alpha')):
+        candidate = os.path.join(folder, name)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(base, name)
+
+
+def settings_path():
+    """settings.json lives in the user's app data folder, not next to the program"""
+    if os.name == 'nt':
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        base = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config')
+    folder = os.path.join(base, 'Festival Extractor')
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, 'settings.json')
+
 
 # One shared session so connections to the same servers are reused
 http = requests.Session()
@@ -214,18 +237,16 @@ class SmartPreviewSystem:
 class FortniteTracksGUI:
     def __init__(self, root):
         self.root = root
-        self.settings_file = "settings.json"
+        self.settings_file = settings_path()
         
         # Add queue for thread communication
         self.download_queue_thread = queue.Queue()
         self.downloading = False
-        self.ffmpeg_ready = False
         
         # Download queue: entries are {'song', 'status' (Waiting/Downloading/Done/Failed), 'error'}
         self.song_queue = []
         self.current_entry = None
         self.finished_this_run = []
-        self.ffmpeg_failed = False
         
         # Initialize preview system
         self.preview_system = SmartPreviewSystem()
@@ -256,15 +277,8 @@ class FortniteTracksGUI:
         self.root.geometry("1000x640")
         self.root.minsize(860, 560)
 
-        if getattr(sys, 'frozen', False):
-            application_path = sys._MEIPASS
-        else:
-            application_path = os.path.dirname(os.path.abspath(__file__))
-
         try:
-            icon_path = os.path.join(application_path, "icon.png")
-            if os.path.exists(icon_path):
-                self.root.iconphoto(False, tk.PhotoImage(file=icon_path))
+            self.root.iconphoto(False, tk.PhotoImage(file=resource_path("icon.png")))
         except Exception:
             pass
 
@@ -290,7 +304,7 @@ class FortniteTracksGUI:
         # Bottom bar - status and progress, visible from every tab
         status_bar = ttk.Frame(self.root, padding=(16, 10, 16, 14))
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.status_label = ttk.Label(status_bar, text="Getting things ready...")
+        self.status_label = ttk.Label(status_bar, text="Ready - pick a song to download")
         self.status_label.pack(side=tk.LEFT)
         self.percent_label = ttk.Label(status_bar, text="", style="Muted.TLabel", width=5, anchor="e")
         self.percent_label.pack(side=tk.RIGHT)
@@ -349,9 +363,6 @@ class FortniteTracksGUI:
 
         self.show_empty_song_info()
 
-        # Initialize FFmpeg first
-        self.setup_ffmpeg()
-
         # Load the song list in the background so the window opens right away
         self.songs = []
         self.filtered_songs = []
@@ -361,168 +372,11 @@ class FortniteTracksGUI:
         self.check_download_queue()
 
         try:
-            logo_path = os.path.join(application_path, "logo.png")
-            if not os.path.exists(logo_path):
-                logo_path = "logo.png"
-            if os.path.exists(logo_path):
-                image = Image.open(logo_path)
-                image = image.resize((200, 70), Image.LANCZOS)
-                self.cached_logo = ImageTk.PhotoImage(image)
-            else:
-                self.cached_logo = None
+            image = Image.open(resource_path("logo.png"))
+            image = image.resize((200, 70), Image.LANCZOS)
+            self.cached_logo = ImageTk.PhotoImage(image)
         except Exception:
             self.cached_logo = None
-
-    def setup_ffmpeg(self):
-        """Setup FFmpeg in background thread"""
-        setup_thread = threading.Thread(target=self.setup_ffmpeg_worker, daemon=True)
-        setup_thread.start()
-
-    def setup_ffmpeg_worker(self):
-        """Background worker to setup FFmpeg"""
-        try:
-            self.ffmpeg_path = self.get_or_download_ffmpeg()
-            self.ffmpeg_ready = True
-            self.update_status("Ready - pick a song to download")
-            self.update_progress(0)
-        except Exception as e:
-            self.ffmpeg_failed = True
-            self.update_status("Audio tools are not available")
-            self.show_error(f"FFmpeg setup failed: {str(e)}")
-
-    def get_or_download_ffmpeg(self):
-        """Get FFmpeg path or download if needed"""
-        # Determine the correct directory for FFmpeg
-        if getattr(sys, 'frozen', False):
-            # Running as executable
-            base_dir = os.path.dirname(sys.executable)
-        else:
-            # Running as script
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        ffmpeg_dir = os.path.join(base_dir, "ffmpeg_bin")
-        
-        system = platform.system()
-        if system == "Windows":
-            ffmpeg_exe = os.path.join(ffmpeg_dir, "ffmpeg.exe")
-        else:
-            ffmpeg_exe = os.path.join(ffmpeg_dir, "ffmpeg")
-        
-        # Check if FFmpeg already exists
-        if os.path.exists(ffmpeg_exe):
-            return ffmpeg_exe
-        
-        # Download FFmpeg
-        self.update_status("First time setup - downloading tools...")
-        return self.download_ffmpeg_for_platform(ffmpeg_dir)
-
-    def download_ffmpeg_for_platform(self, ffmpeg_dir):
-        """Download FFmpeg for the current platform"""
-        system = platform.system()
-        machine = platform.machine().lower()
-        
-        # Create directory
-        os.makedirs(ffmpeg_dir, exist_ok=True)
-        
-        if system == "Windows":
-            if "64" in machine or "amd64" in machine or "x86_64" in machine:
-                url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-            else:
-                # Fallback for 32-bit (rare these days)
-                url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-            
-            return self.download_and_extract_windows(url, ffmpeg_dir)
-            
-        elif system == "Darwin":  # macOS
-            # Use homebrew static builds
-            url = "https://evermeet.cx/ffmpeg/ffmpeg-6.0.zip"
-            return self.download_and_extract_macos(url, ffmpeg_dir)
-            
-        else:  # Linux
-            if "64" in machine or "amd64" in machine or "x86_64" in machine:
-                url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-            else:
-                url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
-            
-            return self.download_and_extract_linux(url, ffmpeg_dir)
-
-    def download_and_extract_windows(self, url, ffmpeg_dir):
-        """Download and extract FFmpeg for Windows"""
-        self.update_status("Downloading audio processor...")
-        self.update_progress(5)
-        
-        # Download
-        zip_path = os.path.join(ffmpeg_dir, "ffmpeg.zip")
-        self.download_with_progress(url, zip_path, 5, 70)
-        
-        self.update_status("Setting up audio processor...")
-        self.update_progress(75)
-        
-        # Extract
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for file_info in zip_ref.infolist():
-                if file_info.filename.endswith('ffmpeg.exe'):
-                    # Extract just the ffmpeg.exe
-                    with zip_ref.open(file_info) as source:
-                        ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg.exe")
-                        with open(ffmpeg_path, 'wb') as target:
-                            shutil.copyfileobj(source, target)
-                    break
-        
-        os.remove(zip_path)
-        self.update_progress(100)
-        return ffmpeg_path
-
-    def download_and_extract_macos(self, url, ffmpeg_dir):
-        """Download and extract FFmpeg for macOS"""
-        self.update_status("Downloading audio processor...")
-        self.update_progress(5)
-        
-        # Download
-        zip_path = os.path.join(ffmpeg_dir, "ffmpeg.zip")
-        self.download_with_progress(url, zip_path, 5, 70)
-        
-        self.update_status("Setting up audio processor...")
-        self.update_progress(75)
-        
-        # Extract
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(ffmpeg_dir)
-        
-        ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
-        os.chmod(ffmpeg_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-        
-        os.remove(zip_path)
-        self.update_progress(100)
-        return ffmpeg_path
-
-    def download_and_extract_linux(self, url, ffmpeg_dir):
-        """Download and extract FFmpeg for Linux"""
-        self.update_status("Downloading audio processor...")
-        self.update_progress(5)
-        
-        # Download
-        tar_path = os.path.join(ffmpeg_dir, "ffmpeg.tar.xz")
-        self.download_with_progress(url, tar_path, 5, 70)
-        
-        self.update_status("Setting up audio processor...")
-        self.update_progress(75)
-        
-        # Extract
-        with tarfile.open(tar_path, 'r:xz') as tar_ref:
-            for member in tar_ref.getmembers():
-                if member.name.endswith('ffmpeg') and not '/' in member.name.split('/')[-1]:
-                    # Extract the ffmpeg binary
-                    member.name = "ffmpeg"  # Rename to just ffmpeg
-                    tar_ref.extract(member, ffmpeg_dir)
-                    break
-        
-        ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg")
-        os.chmod(ffmpeg_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-        
-        os.remove(tar_path)
-        self.update_progress(100)
-        return ffmpeg_path
 
     def is_epic_games_song(self, artist):
         """Check if song is made by Epic Games"""
@@ -610,22 +464,6 @@ class FortniteTracksGUI:
         """Handle when no preview is found"""
         self.preview_status.config(text="No preview available")
         self.preview_button.config(text="▶  Preview", state="normal")
-
-    def download_with_progress(self, url, output_path, start_progress, end_progress):
-        """Download file with progress updates"""
-        response = http.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded_size = 0
-        
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded_size += len(chunk)
-                if total_size > 0:
-                    progress = start_progress + int((downloaded_size / total_size) * (end_progress - start_progress))
-                    self.update_progress(progress)
 
     def check_download_queue(self):
         """Handle messages from worker threads (runs on the Tk thread)"""
@@ -824,11 +662,9 @@ class FortniteTracksGUI:
             self.set_progress(100)
             self.set_status(f"Done! {len(done)} song{'s' if len(done) != 1 else ''} extracted to {self.extract_folder}")
 
-    def decompress_blurl(self, filepath):
-        with open(filepath, 'rb') as f:
-            f.seek(8)
-            decompressed = zlib.decompress(f.read())
-            return json.loads(decompressed)
+    def parse_blurl(self, data):
+        """A .blurl is 8 header bytes followed by zlib-compressed JSON"""
+        return json.loads(zlib.decompress(data[8:]))
 
     def parse_envelope(self, ev_b64):
         b = base64.b64decode(ev_b64)
@@ -870,19 +706,15 @@ class FortniteTracksGUI:
         return None
 
     def get_keys_path(self):
-        """Find keys.bin next to the program, inside the bundled exe, or in the working folder"""
-        folders = []
+        """keys.bin is bundled in the program; one placed next to the exe overrides it (for updated keys)"""
         if getattr(sys, 'frozen', False):
-            folders += [os.path.dirname(sys.executable), sys._MEIPASS]
-        else:
-            folders.append(os.path.dirname(os.path.abspath(__file__)))
-        folders.append(os.getcwd())
-
-        for folder in folders:
-            keys_path = os.path.join(folder, 'keys.bin')
-            if os.path.exists(keys_path):
-                return keys_path
-        raise Exception("keys.bin not found - put it in the same folder as the program")
+            override = os.path.join(os.path.dirname(sys.executable), 'keys.bin')
+            if os.path.exists(override):
+                return override
+        keys_path = resource_path('keys.bin')
+        if not os.path.exists(keys_path):
+            raise Exception("keys.bin is missing from the program")
+        return keys_path
 
     def http_get(self, url, byte_range=None, retries=3):
         """GET a url (optionally only a byte range of it) with a timeout and retries"""
@@ -1106,13 +938,11 @@ class FortniteTracksGUI:
                     future.cancel()
                 raise
 
-    def convert_blurl_to_mp4(self, blurl_file):
+    def download_track(self, blurl, work_dir):
+        """Download the song's audio track into work_dir; returns (track path, decryption key hex or None)"""
         try:
             self.update_status("Loading song data...")
             self.update_progress(5)
-
-            blurl = self.decompress_blurl(blurl_file)
-            print("BLURL loaded.")
 
             playlists = blurl.get('playlists') or []
             if not playlists:
@@ -1136,32 +966,14 @@ class FortniteTracksGUI:
             self.update_status("Starting download...")
             self.update_progress(10)
 
-            os.makedirs('downloads', exist_ok=True)
-            output_path = os.path.join('downloads', 'track.mp4')
-            with open(output_path, 'wb') as out:
+            track_path = os.path.join(work_dir, 'track.mp4')
+            with open(track_path, 'wb') as out:
                 out.write(self.http_get(*init_download))
                 self.download_segments(segments, bool(seg_info['media']), out)
-
-            self.update_status("Processing audio file...")
-            self.update_progress(75)
-
-            if key_hex:
-                creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                result = subprocess.run([
-                    self.ffmpeg_path, '-y', '-decryption_key', key_hex,
-                    '-i', output_path, '-c', 'copy', 'master_audio.mp4'
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=creation_flags)
-                if result.returncode != 0:
-                    raise Exception(f"FFmpeg decryption failed: {result.stderr.decode(errors='ignore')[-300:]}")
-            else:
-                os.replace(output_path, 'master_audio.mp4')
-
-            print("Done! Output: master_audio.mp4")
+            return track_path, key_hex
 
         except Exception as e:
             raise Exception(f"BLURL conversion failed: {str(e)}")
-        finally:
-            shutil.rmtree('downloads', ignore_errors=True)
 
     def download_song_thread(self, entry):
         """Background thread: download one queued song and report the result to the UI"""
@@ -1178,18 +990,9 @@ class FortniteTracksGUI:
 
     def download_and_extract(self, song):
         """Download a song and extract its stems (raises on failure)"""
-        if not self.ffmpeg_ready:
-            self.update_status("Hang tight, setting up tools...")
-            # Wait for FFmpeg to be ready
-            while not self.ffmpeg_ready:
-                if self.ffmpeg_failed:
-                    raise Exception("FFmpeg is not available")
-                time.sleep(0.5)
-
         if not song['sid']:
             raise Exception("No song ID available")
 
-        self.delete_temporary_files()
         api_url = f"https://cdn.qstv.on.epicgames.com/{song['sid']}"
         print(f"Fetching from API URL: {api_url}")
 
@@ -1216,26 +1019,16 @@ class FortniteTracksGUI:
                     self.update_status("Downloading song data...")
                     self.update_progress(2)
 
-                    with http.get(download_url, stream=True, timeout=30) as r:
-                        r.raise_for_status()
-                        total_size = int(r.headers.get('content-length', 0))
-                        downloaded_size = 0
-                        chunk_size = 8192
+                    blurl_data = self.http_get(download_url)
+                    self.update_progress(5)
 
-                        with open("master.blurl", "wb") as file:
-                            for chunk in r.iter_content(chunk_size=chunk_size):
-                                file.write(chunk)
-                                downloaded_size += len(chunk)
-                                if total_size > 0:
-                                    # BLURL download is 2% to 5%
-                                    progress = 2 + int((downloaded_size / total_size) * 3)
-                                    self.update_progress(progress)
+                    # Temporary files go to the system temp folder and are removed afterwards
+                    with tempfile.TemporaryDirectory(prefix="festival_extractor_") as work_dir:
+                        track_path, key_hex = self.download_track(self.parse_blurl(blurl_data), work_dir)
 
-                    self.convert_blurl_to_mp4("master.blurl")
-
-                    self.update_status("Creating audio stems...")
-                    self.update_progress(80)
-                    self.extract_audio_stems(song['title'], song['artist'])
+                        self.update_status("Creating audio stems...")
+                        self.update_progress(75)
+                        self.extract_audio_stems(track_path, key_hex, song['title'], song['artist'])
 
                     self.update_status("Done!")
                     self.update_progress(100)
@@ -1415,8 +1208,11 @@ class FortniteTracksGUI:
             json.dump(settings, f, indent=4)
 
     def load_settings(self):
-        if os.path.exists(self.settings_file):
-            with open(self.settings_file, "r") as f:
+        settings_file = self.settings_file
+        if not os.path.exists(settings_file) and os.path.exists("settings.json"):
+            settings_file = "settings.json"  # settings from older versions, saved next to the program
+        if os.path.exists(settings_file):
+            with open(settings_file, "r") as f:
                 settings = json.load(f)
                 return {
                     "extract_folder": settings.get("extract_folder", os.getcwd()),
@@ -1438,12 +1234,6 @@ class FortniteTracksGUI:
             "extracting_method": "Stereo",
             "file_naming": "Only Stem Type"
         }
-
-    @staticmethod
-    def get_resource_path(relative_path):
-        if getattr(sys, 'frozen', False):
-            return os.path.join(sys._MEIPASS, relative_path)
-        return relative_path
 
     def schedule_search(self, event=None):
         """Filter once typing pauses instead of on every key"""
@@ -1711,119 +1501,100 @@ class FortniteTracksGUI:
             # Fallback to default
             return f"{safe_stem}.{file_extension}"
 
-    def delete_temporary_files(self):
-        if os.path.exists("master.blurl"):
-            os.remove("master.blurl")
-        if os.path.exists("master_audio.mp4"):
-            os.remove("master_audio.mp4")
+    def stem_plan(self):
+        """[(file name, channels to take)] for the chosen method; None means the stereo mix of everything"""
+        method = self.extracting_method_var.get()
+        if method == "Mono":
+            return [(f"{name}_{side}", [2 * i + j]) for i, name in enumerate(STEM_NAMES)
+                    for j, side in enumerate(("Left", "Right"))]
+        if method == "Single File":
+            return [("master", None)]
+        return [(name, [2 * i, 2 * i + 1]) for i, name in enumerate(STEM_NAMES)]
 
-    def extract_audio_stems(self, song_title, artist_name):
+    def extract_audio_stems(self, track_path, key_hex, song_title, artist_name):
+        """Decrypt and decode the 10-channel track and write the stems, chunk by chunk to keep memory low"""
+        os.makedirs(self.extract_folder, exist_ok=True)
+        sanitized_title = self.sanitize_folder_name(song_title)
+        stem_folder = os.path.join(self.extract_folder, f"{sanitized_title} - stems")
+        os.makedirs(stem_folder, exist_ok=True)
+
+        selected_format = self.file_format_var.get()
+        plan = self.stem_plan()
+        outputs = []
+
         try:
-            if not os.path.exists("master_audio.mp4"):
-                raise Exception("master_audio.mp4 not found")
+            with av.open(track_path, options={'decryption_key': key_hex} if key_hex else {}) as source:
+                stream = source.streams.audio[0]
+                channels = stream.codec_context.channels
+                rate = stream.codec_context.sample_rate
+                if channels < 10:
+                    raise Exception(f"Expected 10 audio channels, the track has {channels}")
+                duration = float(source.duration / av.time_base) if source.duration else 0
 
-            os.makedirs(self.extract_folder, exist_ok=True)
-            sanitized_title = self.sanitize_folder_name(song_title)
-            stem_folder = os.path.join(self.extract_folder, f"{sanitized_title} - stems")
-            os.makedirs(stem_folder, exist_ok=True)
+                for name, picks in plan:
+                    filename = self.generate_filename(name, song_title, artist_name, selected_format)
+                    container = av.open(os.path.join(stem_folder, filename), 'w')
+                    out_stream = container.add_stream(AUDIO_CODECS[selected_format], rate=rate,
+                                                      layout='mono' if picks and len(picks) == 1 else 'stereo')
+                    if selected_format == "mp3":
+                        out_stream.bit_rate = 320000
+                    outputs.append((container, out_stream, picks))
 
-            selected_format = self.file_format_var.get()
-            extracting_method = self.extracting_method_var.get()
+                # Decoders give planar audio, which PyAV can't turn into arrays above 8 channels - use interleaved
+                resampler = None
+                pending, pending_samples, written = [], 0, 0
 
-            extra_options = []
-            if selected_format == "mp3":
-                extra_options = ["-b:a", "320k"]
+                def write_pending():
+                    nonlocal pending, pending_samples, written
+                    if not pending:
+                        return
+                    samples = np.concatenate(pending)
+                    pending, pending_samples = [], 0
+                    for container, out_stream, picks in outputs:
+                        if picks is None:
+                            # Even channels are the left sides, odd channels the right sides
+                            data = np.stack([samples[:, 0::2].mean(axis=1), samples[:, 1::2].mean(axis=1)], axis=1)
+                        else:
+                            data = samples[:, picks]
+                        frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(data, dtype=np.float32).reshape(1, -1),
+                                                           format='flt', layout='mono' if data.shape[1] == 1 else 'stereo')
+                        frame.sample_rate = rate
+                        frame.pts = written
+                        for packet in out_stream.encode(frame):
+                            container.mux(packet)
+                    written += len(samples)
 
-            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                for frame in source.decode(stream):
+                    if resampler is None:
+                        resampler = av.AudioResampler(format='flt', layout=frame.layout, rate=frame.rate)
+                    for packed in resampler.resample(frame):
+                        pending.append(packed.to_ndarray().reshape(-1, channels))
+                        pending_samples += packed.samples
+                    if pending_samples >= rate:
+                        write_pending()
+                        if duration:
+                            self.update_progress(75 + int(min(written / rate / duration, 1) * 20))
+                write_pending()
 
-            if extracting_method == "Stereo":
-                # Use filter_complex for modern FFmpeg versions (7.x+)
-                filter_complex = "[0:a]channelsplit=channel_layout=5.1.4[FL][FR][FC][LFE][BL][BR][SL][SR][TFL][TFR];" \
-                               "[FL][FR]amerge=inputs=2[drums];" \
-                               "[FC][LFE]amerge=inputs=2[bass];" \
-                               "[BL][BR]amerge=inputs=2[lead];" \
-                               "[SL][SR]amerge=inputs=2[vocals];" \
-                               "[TFL][TFR]amerge=inputs=2[other]"
-                
-                # Generate filenames based on user preference
-                drums_filename = self.generate_filename("Drums", song_title, artist_name, selected_format)
-                bass_filename = self.generate_filename("Bass", song_title, artist_name, selected_format)
-                lead_filename = self.generate_filename("Lead", song_title, artist_name, selected_format)
-                vocals_filename = self.generate_filename("Vocals", song_title, artist_name, selected_format)
-                other_filename = self.generate_filename("Other", song_title, artist_name, selected_format)
-                
-                ffmpeg_command = [
-                    self.ffmpeg_path, "-y", "-i", "master_audio.mp4",
-                    "-filter_complex", filter_complex,
-                    "-map", "[drums]", *extra_options, os.path.join(stem_folder, drums_filename),
-                    "-map", "[bass]", *extra_options, os.path.join(stem_folder, bass_filename),
-                    "-map", "[lead]", *extra_options, os.path.join(stem_folder, lead_filename),
-                    "-map", "[vocals]", *extra_options, os.path.join(stem_folder, vocals_filename),
-                    "-map", "[other]", *extra_options, os.path.join(stem_folder, other_filename)
-                ]
-                
-            elif extracting_method == "Mono":
-                # Extract individual channels for mono
-                filter_complex = "[0:a]channelsplit=channel_layout=5.1.4[FL][FR][FC][LFE][BL][BR][SL][SR][TFL][TFR]"
-                
-                # Generate filenames for mono channels
-                drums_left_filename = self.generate_filename("Drums_Left", song_title, artist_name, selected_format)
-                drums_right_filename = self.generate_filename("Drums_Right", song_title, artist_name, selected_format)
-                bass_left_filename = self.generate_filename("Bass_Left", song_title, artist_name, selected_format)
-                bass_right_filename = self.generate_filename("Bass_Right", song_title, artist_name, selected_format)
-                lead_left_filename = self.generate_filename("Lead_Left", song_title, artist_name, selected_format)
-                lead_right_filename = self.generate_filename("Lead_Right", song_title, artist_name, selected_format)
-                vocals_left_filename = self.generate_filename("Vocals_Left", song_title, artist_name, selected_format)
-                vocals_right_filename = self.generate_filename("Vocals_Right", song_title, artist_name, selected_format)
-                other_left_filename = self.generate_filename("Other_Left", song_title, artist_name, selected_format)
-                other_right_filename = self.generate_filename("Other_Right", song_title, artist_name, selected_format)
-                
-                ffmpeg_command = [
-                    self.ffmpeg_path, "-y", "-i", "master_audio.mp4",
-                    "-filter_complex", filter_complex,
-                    "-map", "[FL]", *extra_options, os.path.join(stem_folder, drums_left_filename),
-                    "-map", "[FR]", *extra_options, os.path.join(stem_folder, drums_right_filename),
-                    "-map", "[FC]", *extra_options, os.path.join(stem_folder, bass_left_filename),
-                    "-map", "[LFE]", *extra_options, os.path.join(stem_folder, bass_right_filename),
-                    "-map", "[BL]", *extra_options, os.path.join(stem_folder, lead_left_filename),
-                    "-map", "[BR]", *extra_options, os.path.join(stem_folder, lead_right_filename),
-                    "-map", "[SL]", *extra_options, os.path.join(stem_folder, vocals_left_filename),
-                    "-map", "[SR]", *extra_options, os.path.join(stem_folder, vocals_right_filename),
-                    "-map", "[TFL]", *extra_options, os.path.join(stem_folder, other_left_filename),
-                    "-map", "[TFR]", *extra_options, os.path.join(stem_folder, other_right_filename)
-                ]
-                
-            elif extracting_method == "Single File":
-                # Mix all channels to stereo
-                master_filename = self.generate_filename("master", song_title, artist_name, selected_format)
-                ffmpeg_command = [
-                    self.ffmpeg_path, "-y", "-i", "master_audio.mp4",
-                    "-filter_complex", "[0:a]pan=stereo|c0<c0+c2+c4+c6+c8|c1<c1+c3+c5+c7+c9[out]",
-                    "-map", "[out]", "-ac", "2", *extra_options, 
-                    os.path.join(stem_folder, master_filename)
-                ]
+                for container, out_stream, picks in outputs:
+                    for packet in out_stream.encode(None):
+                        container.mux(packet)
+        except av.error.InvalidDataError as e:
+            raise Exception(f"Could not decrypt or decode the audio: {e}")
+        finally:
+            for container, out_stream, picks in outputs:
+                container.close()
 
-            subprocess.run(ffmpeg_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
-            print(f"Audio extracted successfully into folder: {stem_folder}")
+        print(f"Audio extracted successfully into folder: {stem_folder}")
+        self.update_progress(95)
 
-            self.update_progress(95)
-            self.update_status("Cleaning up...")
-
-            os.remove("master_audio.mp4")
-            os.remove("master.blurl")
-            print("Temporary files deleted.")
-
-            if self.auto_open_folder:
-                system = platform.system()
-                if system == "Windows":
-                    subprocess.Popen(f'explorer "{os.path.normpath(stem_folder)}"')
-                elif system == "Darwin":
-                    subprocess.Popen(["open", stem_folder])
-                else:
-                    subprocess.Popen(["xdg-open", stem_folder])
-
-        except subprocess.CalledProcessError as e:
-            raise Exception(f"FFmpeg extraction failed: {str(e)}")
+        if self.auto_open_folder:
+            if os.name == 'nt':
+                os.startfile(stem_folder)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(["open", stem_folder])
+            else:
+                subprocess.Popen(["xdg-open", stem_folder])
 
 
 if __name__ == "__main__":

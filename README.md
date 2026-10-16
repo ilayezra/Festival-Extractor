@@ -20,6 +20,15 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
 1. Download the latest **[Release](https://github.com/ilayezra/Festival-Extractor/releases)**
 2. Run `Festival Extractor`
 
+Everything is inside the single `Festival Extractor.exe` - no ffmpeg or other files to install.
+
+### Build from source
+```
+pip install -r requirements.txt pyinstaller
+pyinstaller FFR.spec
+```
+The exe is written to `dist/`. To run without building: `python FFR.py`.
+
 ## 🎛 Usage
 1. Launch **Fortnite Festival Extractor**
 2. Search for a song or browse the list
