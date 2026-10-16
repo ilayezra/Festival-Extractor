@@ -1,5 +1,7 @@
 import tkinter as tk
-from tkinter import ttk, Scrollbar, Button, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog
+import tkinter.font as tkfont
+import sv_ttk
 import requests
 from PIL import Image, ImageTk
 from io import BytesIO
@@ -219,9 +221,11 @@ class FortniteTracksGUI:
         self.downloading = False
         self.ffmpeg_ready = False
         
-        # Add song queue for downloads
+        # Download queue: entries are {'song', 'status' (Waiting/Downloading/Done/Failed), 'error'}
         self.song_queue = []
-        self.current_download_index = 0
+        self.current_entry = None
+        self.finished_this_run = []
+        self.ffmpeg_failed = False
         
         # Initialize preview system
         self.preview_system = SmartPreviewSystem()
@@ -249,13 +253,14 @@ class FortniteTracksGUI:
         self.file_naming_var = tk.StringVar(value=self.file_naming)
 
         self.root.title("Fortnite Festival Extractor")
-        self.root.geometry("900x600")
-        
+        self.root.geometry("1000x640")
+        self.root.minsize(860, 560)
+
         if getattr(sys, 'frozen', False):
             application_path = sys._MEIPASS
         else:
             application_path = os.path.dirname(os.path.abspath(__file__))
-        
+
         try:
             icon_path = os.path.join(application_path, "icon.png")
             if os.path.exists(icon_path):
@@ -264,109 +269,100 @@ class FortniteTracksGUI:
             pass
 
         self.style = ttk.Style()
-        self.style.theme_use("clam")
+        self.apply_theme()
 
-        main_frame = ttk.Frame(self.root, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # Top bar - search, song count, settings
+        top_bar = ttk.Frame(self.root, padding=(16, 14, 16, 10))
+        top_bar.pack(fill=tk.X)
+        ttk.Button(top_bar, text="⚙  Settings", command=self.open_settings_window).pack(side=tk.RIGHT)
+        self.song_count_label = ttk.Label(top_bar, text="Loading songs...", style="Muted.TLabel")
+        self.song_count_label.pack(side=tk.RIGHT, padx=14)
 
-        # Left side - Song list with search
-        left_frame = ttk.Frame(main_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
-
-        search_frame = ttk.Frame(left_frame)
-        search_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(search_frame, text="Search Song:").pack(side=tk.LEFT, padx=(0, 5))
-        self.search_entry = ttk.Entry(search_frame, width=50)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(top_bar, textvariable=self.search_var)
         self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.search_entry.bind("<KeyRelease>", self.schedule_search)
+        self.search_entry.bind("<FocusIn>", self.hide_search_placeholder)
+        self.search_entry.bind("<FocusOut>", self.show_search_placeholder)
+        self.search_placeholder_shown = False
+        self.show_search_placeholder()
 
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-        self.song_listbox = tk.Listbox(list_frame, width=60, height=25, bg="#2E2E2E", fg="#FFFFFF", font=("Arial", 12))
-        self.song_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.song_listbox.bind("<<ListboxSelect>>", self.on_song_select)
+        # Bottom bar - status and progress, visible from every tab
+        status_bar = ttk.Frame(self.root, padding=(16, 10, 16, 14))
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_label = ttk.Label(status_bar, text="Getting things ready...")
+        self.status_label.pack(side=tk.LEFT)
+        self.percent_label = ttk.Label(status_bar, text="", style="Muted.TLabel", width=5, anchor="e")
+        self.percent_label.pack(side=tk.RIGHT)
+        self.progress = ttk.Progressbar(status_bar, orient="horizontal", length=260, mode="determinate", maximum=100)
+        self.progress.pack(side=tk.RIGHT, padx=10)
 
-        scrollbar = Scrollbar(list_frame, orient=tk.VERTICAL, command=self.song_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.song_listbox.config(yscrollcommand=scrollbar.set)
+        body = ttk.Frame(self.root, padding=(16, 0))
+        body.pack(fill=tk.BOTH, expand=True)
 
-        # Right side - Tabs
-        right_frame = ttk.Frame(main_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        # Right side - Song / Queue tabs
+        right_panel = ttk.Frame(body, width=380)
+        right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(14, 0))
+        right_panel.pack_propagate(False)
 
-        # Create notebook for tabs
-        self.notebook = ttk.Notebook(right_frame)
+        # Left side - song table
+        list_frame = ttk.Frame(body)
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.song_tree = ttk.Treeview(list_frame, columns=("artist", "title"), show="headings", selectmode="browse")
+        self.song_tree.heading("artist", text="Artist", anchor="w")
+        self.song_tree.heading("title", text="Title", anchor="w")
+        self.song_tree.column("artist", width=200, anchor="w")
+        self.song_tree.column("title", width=280, anchor="w")
+        song_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.song_tree.yview)
+        self.song_tree.configure(yscrollcommand=song_scroll.set)
+        song_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.song_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.song_tree.bind("<<TreeviewSelect>>", self.on_song_select)
+
+        self.notebook = ttk.Notebook(right_panel)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Song Info tab
-        self.song_info_frame = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(self.song_info_frame, text="Song Info")
+        self.song_info_frame = ttk.Frame(self.notebook, padding=14)
+        self.notebook.add(self.song_info_frame, text="Song")
 
-        # Queue tab
-        self.queue_frame = ttk.Frame(self.notebook, padding=(10, 5, 10, 10))  # top, right, bottom, left
+        self.queue_frame = ttk.Frame(self.notebook, padding=14)
         self.notebook.add(self.queue_frame, text="Queue")
 
-        # Progress bar (shared, but only visible in queue tab initially)
-        self.progress = ttk.Progressbar(self.queue_frame, orient="horizontal", length=400, mode="determinate")
-        self.progress.pack(pady=2)  # Reduced from 10 to 2
-        self.progress["maximum"] = 100
+        queue_list = ttk.Frame(self.queue_frame)
+        queue_list.pack(fill=tk.BOTH, expand=True)
+        self.queue_tree = ttk.Treeview(queue_list, columns=("num", "song", "status"), show="headings", selectmode="extended")
+        for column, text, width, stretch in (("num", "#", 34, False), ("song", "Song", 200, True), ("status", "Status", 80, False)):
+            self.queue_tree.heading(column, text=text, anchor="w")
+            self.queue_tree.column(column, width=width, anchor="w", stretch=stretch)
+        queue_scroll = ttk.Scrollbar(queue_list, orient=tk.VERTICAL, command=self.queue_tree.yview)
+        self.queue_tree.configure(yscrollcommand=queue_scroll.set)
+        queue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.queue_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.queue_tree.bind("<Double-1>", self.on_queue_double_click)
 
-        self.status_label = ttk.Label(self.queue_frame, text="Getting things ready...", font=("Arial", 12))
-        self.status_label.pack(pady=2)  # Reduced from 5 to 2
+        ttk.Button(self.queue_frame, text="⬇  Download All", style="Accent.TButton",
+                   command=self.download_all_queue).pack(fill=tk.X, pady=(10, 0))
+        queue_buttons = ttk.Frame(self.queue_frame)
+        queue_buttons.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(queue_buttons, text="Remove", command=self.remove_selected_from_queue).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(queue_buttons, text="Clear", command=self.clear_queue).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
-        # Queue listbox
-        queue_list_frame = ttk.Frame(self.queue_frame)
-        queue_list_frame.pack(fill=tk.X, expand=False, pady=(5, 2))
-        
-        ttk.Label(queue_list_frame, text="Download Queue:", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 5))
-        
-        self.queue_listbox = tk.Listbox(queue_list_frame, height=20, bg="#2E2E2E", fg="#FFFFFF", font=("Arial", 11))
-        self.queue_listbox.pack(fill=tk.BOTH, expand=True)
-        self.queue_listbox.bind("<<ListboxSelect>>", self.on_queue_select)
+        self.show_empty_song_info()
 
-        # Queue buttons frame - Triangle layout
-        queue_buttons_frame = ttk.Frame(self.queue_frame)
-        queue_buttons_frame.pack(fill=tk.X, pady=(5, 5))
-
-        # Top row - Download All button (centered)
-        top_button_frame = ttk.Frame(queue_buttons_frame)
-        top_button_frame.pack(pady=(0, 3))
-
-        self.download_all_button = ttk.Button(top_button_frame, text="Download All", command=self.download_all_queue)
-        self.download_all_button.pack()
-
-        # Bottom row - Clear Queue and Remove Selected buttons (side by side, centered)
-        bottom_button_frame = ttk.Frame(queue_buttons_frame)
-        bottom_button_frame.pack(pady=(0, 0))
-
-        self.clear_queue_button = ttk.Button(bottom_button_frame, text="Clear Queue", command=self.clear_queue)
-        self.clear_queue_button.pack(side=tk.LEFT)
-
-        self.remove_selected_button = ttk.Button(bottom_button_frame, text="Remove Selected", command=self.remove_selected_from_queue)
-        self.remove_selected_button.pack(side=tk.LEFT)
-
-        # Settings button
-        self.settings_button = ttk.Button(self.root, text="Settings", command=self.open_settings_window)
-        self.settings_button.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-10)
-
-        self.apply_theme()
-        
         # Initialize FFmpeg first
         self.setup_ffmpeg()
-        
+
         # Load the song list in the background so the window opens right away
         self.songs = []
         self.filtered_songs = []
-        self.song_listbox.insert(tk.END, "Loading songs...")
         threading.Thread(target=self.load_songs_worker, daemon=True).start()
 
         # Start checking the download queue
         self.check_download_queue()
 
         try:
-            if getattr(sys, 'frozen', False):
-                logo_path = os.path.join(sys._MEIPASS, "logo.png")
-            else:
+            logo_path = os.path.join(application_path, "logo.png")
+            if not os.path.exists(logo_path):
                 logo_path = "logo.png"
             if os.path.exists(logo_path):
                 image = Image.open(logo_path)
@@ -387,11 +383,12 @@ class FortniteTracksGUI:
         try:
             self.ffmpeg_path = self.get_or_download_ffmpeg()
             self.ffmpeg_ready = True
-            self.update_status("All set! Pick songs and add to queue 🎵")
+            self.update_status("Ready - pick a song to download")
             self.update_progress(0)
         except Exception as e:
+            self.ffmpeg_failed = True
+            self.update_status("Audio tools are not available")
             self.show_error(f"FFmpeg setup failed: {str(e)}")
-            self.ffmpeg_ready = False
 
     def get_or_download_ffmpeg(self):
         """Get FFmpeg path or download if needed"""
@@ -575,11 +572,11 @@ class FortniteTracksGUI:
         except Exception as e:
             print(f"Playback error: {e}")
             self.preview_status.config(text="Playback failed")
-            self.preview_button.config(text="▶ Play Preview", state="normal")
+            self.preview_button.config(text="▶  Preview", state="normal")
             return
 
         self.preview_status.config(text="Playing 30s preview...")
-        self.preview_button.config(text="⏹ Stop Preview", state="normal")
+        self.preview_button.config(text="⏹  Stop", state="normal")
 
         # Auto-stop after 30 seconds
         self.cancel_auto_stop()
@@ -596,7 +593,7 @@ class FortniteTracksGUI:
         self.preview_system.stop()
         try:
             self.preview_status.config(text="")
-            self.preview_button.config(text="▶ Play Preview", state="normal")
+            self.preview_button.config(text="▶  Preview", state="normal")
         except (AttributeError, tk.TclError):
             pass
 
@@ -612,7 +609,7 @@ class FortniteTracksGUI:
     def preview_not_found(self):
         """Handle when no preview is found"""
         self.preview_status.config(text="No preview available")
-        self.preview_button.config(text="▶ Play Preview", state="normal")
+        self.preview_button.config(text="▶  Preview", state="normal")
 
     def download_with_progress(self, url, output_path, start_progress, end_progress):
         """Download file with progress updates"""
@@ -631,28 +628,16 @@ class FortniteTracksGUI:
                     self.update_progress(progress)
 
     def check_download_queue(self):
-        """Check for messages from download thread"""
+        """Handle messages from worker threads (runs on the Tk thread)"""
         try:
             while True:
                 message = self.download_queue_thread.get_nowait()
                 if message['type'] == 'progress':
-                    self.progress["value"] = message['value']
+                    self.set_progress(message['value'])
                 elif message['type'] == 'status':
-                    self.status_label.config(text=message['text'])
+                    self.set_status(message['text'])
                 elif message['type'] == 'error':
                     messagebox.showerror("Error", message['text'])
-                    self.downloading = False
-                elif message['type'] == 'success':
-                    messagebox.showinfo("Success", message['text'])
-                    self.downloading = False
-                elif message['type'] == 'done':
-                    self.downloading = False
-                elif message['type'] == 'next_song':
-                    self.current_download_index += 1
-                    if self.current_download_index < len(self.song_queue):
-                        self.download_next_in_queue()
-                    else:
-                        self.queue_download_complete()
                 elif message['type'] == 'call':
                     try:
                         message['func']()
@@ -660,7 +645,7 @@ class FortniteTracksGUI:
                         print(f"UI update failed: {e}")
         except queue.Empty:
             pass
-        
+
         # Schedule next check
         self.root.after(100, self.check_download_queue)
 
@@ -680,127 +665,164 @@ class FortniteTracksGUI:
         """Thread-safe error display"""
         self.download_queue_thread.put({'type': 'error', 'text': text})
 
-    def show_success(self, text):
-        """Thread-safe success display"""
-        self.download_queue_thread.put({'type': 'success', 'text': text})
+    def set_progress(self, value):
+        self.progress["value"] = value
+        self.percent_label.config(text=f"{int(value)}%" if value else "")
+        if self.current_entry in self.song_queue:
+            row = str(self.song_queue.index(self.current_entry))
+            if self.queue_tree.exists(row):
+                self.queue_tree.set(row, "status", self.queue_status_text(self.current_entry))
 
-    def download_complete(self):
-        """Signal download completion"""
-        self.download_queue_thread.put({'type': 'done'})
+    def set_status(self, text):
+        if self.current_entry:
+            text = f"{self.current_entry['song']['title']}  ·  {text}"
+        self.status_label.config(text=text)
 
-    def next_song_signal(self):
-        """Signal to move to next song in queue"""
-        self.download_queue_thread.put({'type': 'next_song'})
+    def find_queue_entry(self, song):
+        return next((entry for entry in self.song_queue if entry['song']['sid'] == song['sid']), None)
+
+    def is_song_in_queue(self, song):
+        """Check if song is already in queue"""
+        return self.find_queue_entry(song) is not None
+
+    def queue_status_text(self, entry):
+        if entry['status'] == 'Downloading':
+            return f"{int(self.progress['value'])}%"
+        return {'Done': "✓ Done", 'Failed': "✗ Failed"}.get(entry['status'], entry['status'])
+
+    def refresh_queue_view(self):
+        """Rebuild the queue table and the tab title"""
+        self.queue_tree.delete(*self.queue_tree.get_children())
+        for i, entry in enumerate(self.song_queue):
+            song = entry['song']
+            self.queue_tree.insert('', 'end', iid=str(i),
+                                   values=(i + 1, f"{song['artist']} - {song['title']}", self.queue_status_text(entry)))
+        pending = sum(1 for entry in self.song_queue if entry['status'] in ('Waiting', 'Downloading'))
+        self.notebook.tab(self.queue_frame, text=f"Queue ({pending})" if pending else "Queue")
 
     def add_to_queue(self, song):
-        """Add song to download queue"""
-        # Check if song is already in queue
-        for queued_song in self.song_queue:
-            if queued_song['sid'] == song['sid']:
-                messagebox.showinfo("Already in Queue", f"{song['title']} is already in the download queue.")
-                return
-        
-        self.song_queue.append(song)
-        self.update_queue_display()
-        self.update_song_info_display()  # Refresh to update button state
+        """Add a song to the queue, or mark a finished/failed one to download again"""
+        entry = self.find_queue_entry(song)
+        if entry is None:
+            self.song_queue.append({'song': song, 'status': 'Waiting', 'error': ''})
+        elif entry['status'] in ('Done', 'Failed'):
+            entry['status'], entry['error'] = 'Waiting', ''
+        self.refresh_queue_view()
+        self.update_song_info_display()
+
+    def download_now(self, song):
+        """Queue the song and start downloading right away if nothing is running"""
+        self.add_to_queue(song)
+        self.start_queue()
 
     def check_easter_egg(self, query):
         """Check for easter egg and handle it"""
         if query == "letmedownloadallthesongs":
-            result = messagebox.askyesno("Easter Egg Found!", 
+            result = messagebox.askyesno("Easter Egg Found!",
                                     "Are you sure you want to add all of the songs into your queue list?")
             if result:
                 # Add all songs to queue (not just filtered ones)
                 added_count = 0
-                for song in self.songs:  # Changed from self.filtered_songs to self.songs
+                for song in self.songs:
                     if not self.is_song_in_queue(song):
-                        self.song_queue.append(song)
+                        self.song_queue.append({'song': song, 'status': 'Waiting', 'error': ''})
                         added_count += 1
-                
-                self.update_queue_display()
+
+                self.refresh_queue_view()
                 self.update_song_info_display()
                 messagebox.showinfo("Songs Added", f"Added {added_count} songs to the queue!")
             return True
         return False
 
     def remove_selected_from_queue(self):
-        """Remove selected song from queue"""
-        selection = self.queue_listbox.curselection()
-        if selection:
-            index = selection[0]
-            removed_song = self.song_queue.pop(index)
-            self.update_queue_display()
-            self.update_song_info_display()  # Refresh to update button state
-            messagebox.showinfo("Removed", f"Removed {removed_song['title']} from queue.")
+        """Remove the selected songs from the queue (except the one downloading)"""
+        rows = sorted((int(row) for row in self.queue_tree.selection()), reverse=True)
+        for row in rows:
+            if self.song_queue[row] is not self.current_entry:
+                del self.song_queue[row]
+        if rows:
+            self.refresh_queue_view()
+            self.update_song_info_display()
 
     def clear_queue(self):
-        """Clear all songs from queue"""
-        if self.song_queue:
-            if messagebox.askyesno("Clear Queue", "Are you sure you want to clear the entire queue?"):
-                self.song_queue.clear()
-                self.update_queue_display()
-                self.update_song_info_display()  # Refresh to update button state
+        """Clear all songs from queue (except the one downloading)"""
+        if any(entry is not self.current_entry for entry in self.song_queue):
+            if messagebox.askyesno("Clear Queue", "Remove all songs from the queue?"):
+                self.song_queue = [entry for entry in self.song_queue if entry is self.current_entry]
+                self.refresh_queue_view()
+                self.update_song_info_display()
 
-    def update_queue_display(self):
-        """Update the queue listbox display"""
-        items = []
-        for i, song in enumerate(self.song_queue):
-            display_text = f"{i+1}. {song['artist']} - {song['title']}"
-            if self.downloading and i == self.current_download_index:
-                display_text += " (Downloading...)"
-            items.append(display_text)
-        self.queue_listbox.delete(0, tk.END)
-        self.queue_listbox.insert(tk.END, *items)
-
-    def on_queue_select(self, event=None):
-        """Handle queue selection - switch to song info tab and show selected song"""
-        selection = self.queue_listbox.curselection()
-        if selection:
-            index = selection[0]
-            if index < len(self.song_queue):
-                selected_song = self.song_queue[index]
-                
-                # Switch to Song Info tab
-                self.notebook.select(0)  # Select first tab (Song Info)
-                
-                # Display the song info
-                self.display_song_info(selected_song)
+    def on_queue_double_click(self, event):
+        """Show the double-clicked queue song in the Song tab"""
+        row = self.queue_tree.identify_row(event.y)
+        if row:
+            self.notebook.select(self.song_info_frame)
+            self.display_song_info(self.song_queue[int(row)]['song'])
 
     def download_all_queue(self):
-        """Start downloading all songs in queue"""
+        """Download every waiting song in the queue (failed ones are retried)"""
         if not self.song_queue:
             messagebox.showwarning("Empty Queue", "No songs in queue to download.")
             return
-            
+
+        for entry in self.song_queue:
+            if entry['status'] == 'Failed':
+                entry['status'], entry['error'] = 'Waiting', ''
+        if not any(entry['status'] in ('Waiting', 'Downloading') for entry in self.song_queue):
+            self.set_status("Everything in the queue is already downloaded")
+            return
+        self.start_queue()
+
+    def start_queue(self):
         if self.downloading:
-            messagebox.showwarning("Download in Progress", "A download is already in progress. Please wait for it to complete.")
+            self.refresh_queue_view()
             return
-        
-        if not self.ffmpeg_ready:
-            messagebox.showwarning("FFmpeg is Not Ready", "Still setting up tools. Please wait a moment and try again.")
-            return
-        
         self.downloading = True
-        self.current_download_index = 0
-        self.update_queue_display()
+        self.finished_this_run = []
         self.download_next_in_queue()
 
     def download_next_in_queue(self):
-        """Download the next song in queue"""
-        if self.current_download_index < len(self.song_queue):
-            song = self.song_queue[self.current_download_index]
-            self.update_queue_display()  # Update to show current downloading
-            download_thread = threading.Thread(target=self.download_song_thread, args=(song, True), daemon=True)
-            download_thread.start()
+        """Start the next waiting song, or wrap up when none are left"""
+        entry = next((entry for entry in self.song_queue if entry['status'] == 'Waiting'), None)
+        if entry is None:
+            self.queue_download_complete()
+            return
+
+        entry['status'] = 'Downloading'
+        self.current_entry = entry
+        self.set_progress(0)
+        self.refresh_queue_view()
+        self.update_song_info_display()
+        threading.Thread(target=self.download_song_thread, args=(entry,), daemon=True).start()
+
+    def song_download_finished(self, entry, error):
+        entry['status'] = 'Failed' if error else 'Done'
+        entry['error'] = error or ''
+        self.finished_this_run.append(entry)
+        self.current_entry = None
+        self.download_next_in_queue()
 
     def queue_download_complete(self):
-        """Handle completion of entire queue download"""
+        """Handle completion of the queue"""
         self.downloading = False
-        self.current_download_index = 0
-        self.song_queue.clear()  # Clear queue after successful download
-        self.update_queue_display()
+        self.current_entry = None
+        self.refresh_queue_view()
         self.update_song_info_display()
-        self.show_success(f"Queue download completed! All songs have been extracted.")
+
+        done = [entry for entry in self.finished_this_run if entry['status'] == 'Done']
+        failed = [entry for entry in self.finished_this_run if entry['status'] == 'Failed']
+        self.finished_this_run = []
+
+        if failed:
+            self.set_progress(0)
+            self.set_status(f"Finished - {len(done)} extracted, {len(failed)} failed")
+            details = "\n".join(f"• {entry['song']['title']}: {entry['error']}" for entry in failed[:10])
+            if len(failed) > 10:
+                details += f"\n...and {len(failed) - 10} more"
+            messagebox.showerror("Some downloads failed", f"{len(done)} extracted, {len(failed)} failed:\n\n{details}")
+        else:
+            self.set_progress(100)
+            self.set_status(f"Done! {len(done)} song{'s' if len(done) != 1 else ''} extracted to {self.extract_folder}")
 
     def decompress_blurl(self, filepath):
         with open(filepath, 'rb') as f:
@@ -1141,226 +1163,181 @@ class FortniteTracksGUI:
         finally:
             shutil.rmtree('downloads', ignore_errors=True)
 
-    def download_song_thread(self, song, is_queue_download=False):
-        """Background thread function for downloading"""
+    def download_song_thread(self, entry):
+        """Background thread: download one queued song and report the result to the UI"""
+        error = None
         try:
-            if not self.ffmpeg_ready:
-                self.update_status("Hang tight, setting up tools...")
-                # Wait for FFmpeg to be ready
-                while not self.ffmpeg_ready:
-                    import time
-                    time.sleep(0.5)
-                
-            if not song['sid']:
-                self.show_error("No song ID available")
-                if is_queue_download:
-                    self.next_song_signal()
-                return
-            
-            self.delete_temporary_files()
-            api_url = f"https://cdn.qstv.on.epicgames.com/{song['sid']}"
-            print(f"Fetching from API URL: {api_url}")
-            
-            self.update_status("Getting song info...")
-            self.update_progress(0)
-            
-            response = http.get(api_url, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            for key, value in data.items():
-                if isinstance(value, dict) and 'baseUrls' in value:
-                    base_urls = value['baseUrls']
-                    if base_urls and len(base_urls) > 0:
-                        base_url = base_urls[0]
-                        url_parts = base_url.rstrip('/').split('/')
-                        if len(url_parts) < 4:
-                            continue
-                            
-                        domain = f"{url_parts[0]}//{url_parts[2]}"
-                        unique_code = url_parts[3]
-                        download_url = f"{domain}/{unique_code}/master.blurl"
-                        
-                        self.update_status("Downloading song data...")
-                        self.update_progress(2)
-                        
-                        with http.get(download_url, stream=True, timeout=30) as r:
-                            r.raise_for_status()
-                            total_size = int(r.headers.get('content-length', 0))
-                            downloaded_size = 0
-                            chunk_size = 8192
-                            
-                            with open("master.blurl", "wb") as file:
-                                for chunk in r.iter_content(chunk_size=chunk_size):
-                                    file.write(chunk)
-                                    downloaded_size += len(chunk)
-                                    if total_size > 0:
-                                        # BLURL download is 2% to 5%
-                                        progress = 2 + int((downloaded_size / total_size) * 3)
-                                        self.update_progress(progress)
-                        
-                        self.convert_blurl_to_mp4("master.blurl")
-                        
-                        self.update_status("Creating audio stems...")
-                        self.update_progress(80)
-                        self.extract_audio_stems(song['title'], song['artist'])
-                        
-                        self.update_status("Download completed! 🎉")
-                        self.update_progress(100)
-                        
-                        if is_queue_download:
-                            self.next_song_signal()
-                        else:
-                            self.show_success(f"Successfully downloaded and extracted stems for: {song['title']}")
-                            self.download_complete()
-                        return
-                
-            error_msg = "Could not find valid download URL in the response"
-            self.show_error(error_msg)
-            if is_queue_download:
-                self.next_song_signal()
-            else:
-                self.download_complete()
-            
+            self.download_and_extract(entry['song'])
         except requests.exceptions.RequestException as e:
-            error_msg = f"Download failed: {str(e)}"
-            self.show_error(error_msg)
-            if is_queue_download:
-                self.next_song_signal()
-            else:
-                self.download_complete()
+            error = f"Download failed: {str(e)}"
         except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            self.show_error(error_msg)
-            if is_queue_download:
-                self.next_song_signal()
-            else:
-                self.download_complete()
+            error = str(e)
+        if error:
+            print(f"Failed: {entry['song']['title']}: {error}")
+        self.run_on_ui(lambda: self.song_download_finished(entry, error))
 
-    def download_song(self, song):
-        """Start download in background thread for single song"""
-        if self.downloading:
-            messagebox.showwarning("Download in Progress", "A download is already in progress. Please wait for it to complete.")
-            return
-        
+    def download_and_extract(self, song):
+        """Download a song and extract its stems (raises on failure)"""
         if not self.ffmpeg_ready:
-            messagebox.showwarning("FFmpeg Not Ready", "Still setting up tools. Please wait a moment and try again.")
-            return
-        
-        self.downloading = True
-        download_thread = threading.Thread(target=self.download_song_thread, args=(song, False), daemon=True)
-        download_thread.start()
+            self.update_status("Hang tight, setting up tools...")
+            # Wait for FFmpeg to be ready
+            while not self.ffmpeg_ready:
+                if self.ffmpeg_failed:
+                    raise Exception("FFmpeg is not available")
+                time.sleep(0.5)
+
+        if not song['sid']:
+            raise Exception("No song ID available")
+
+        self.delete_temporary_files()
+        api_url = f"https://cdn.qstv.on.epicgames.com/{song['sid']}"
+        print(f"Fetching from API URL: {api_url}")
+
+        self.update_status("Getting song info...")
+        self.update_progress(0)
+
+        response = http.get(api_url, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        for key, value in data.items():
+            if isinstance(value, dict) and 'baseUrls' in value:
+                base_urls = value['baseUrls']
+                if base_urls and len(base_urls) > 0:
+                    base_url = base_urls[0]
+                    url_parts = base_url.rstrip('/').split('/')
+                    if len(url_parts) < 4:
+                        continue
+
+                    domain = f"{url_parts[0]}//{url_parts[2]}"
+                    unique_code = url_parts[3]
+                    download_url = f"{domain}/{unique_code}/master.blurl"
+
+                    self.update_status("Downloading song data...")
+                    self.update_progress(2)
+
+                    with http.get(download_url, stream=True, timeout=30) as r:
+                        r.raise_for_status()
+                        total_size = int(r.headers.get('content-length', 0))
+                        downloaded_size = 0
+                        chunk_size = 8192
+
+                        with open("master.blurl", "wb") as file:
+                            for chunk in r.iter_content(chunk_size=chunk_size):
+                                file.write(chunk)
+                                downloaded_size += len(chunk)
+                                if total_size > 0:
+                                    # BLURL download is 2% to 5%
+                                    progress = 2 + int((downloaded_size / total_size) * 3)
+                                    self.update_progress(progress)
+
+                    self.convert_blurl_to_mp4("master.blurl")
+
+                    self.update_status("Creating audio stems...")
+                    self.update_progress(80)
+                    self.extract_audio_stems(song['title'], song['artist'])
+
+                    self.update_status("Done!")
+                    self.update_progress(100)
+                    return
+
+        raise Exception("Could not find valid download URL in the response")
 
     def open_settings_window(self):
         if hasattr(self, "settings_window") and self.settings_window.winfo_exists():
             self.settings_window.lift()
             return
 
-        self.settings_window = tk.Toplevel(self.root)
-        self.settings_window.title("Settings")
-        self.settings_window.geometry("400x300")
-        self.settings_window.attributes('-topmost', True)
-        self.settings_window.resizable(False, False)
-        if os.name == 'nt':
-            self.settings_window.attributes('-toolwindow', True)
+        window = self.settings_window = tk.Toplevel(self.root)
+        window.title("Settings")
+        window.transient(self.root)
+        window.resizable(False, False)
 
-        notebook = ttk.Notebook(self.settings_window)
-        notebook.pack(fill='both', expand=True)
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill='both', expand=True, padx=12, pady=(12, 0))
 
-        display_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(display_frame, text='Display')
+        def page(title):
+            frame = ttk.Frame(notebook, padding=16)
+            frame.columnconfigure(1, weight=1)
+            notebook.add(frame, text=title)
+            return frame
 
-        sorting_frame = ttk.Frame(display_frame)
-        sorting_frame.pack(fill='x', pady=5)
-        ttk.Label(sorting_frame, text="Sort songs by:").pack(side='left', padx=5)
-        sorting_options = ["A-Z by Artist", "A-Z by Song Name", "Last Added"]
+        def field_label(frame, row, text):
+            ttk.Label(frame, text=text).grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
+
+        def dropdown(frame, row, variable, values, command, columnspan=1):
+            box = ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=24)
+            box.grid(row=row, column=1, columnspan=columnspan, sticky='ew', pady=6)
+            box.bind("<<ComboboxSelected>>", lambda e: command())
+            return box
+
+        # Display
+        display = page('Display')
+        field_label(display, 0, "Sort songs by")
         self.sorting_var = tk.StringVar(value=self.sorting_method)
-        sorting_dropdown = ttk.Combobox(sorting_frame, textvariable=self.sorting_var, values=sorting_options, state="readonly")
-        sorting_dropdown.pack(side='left', padx=5)
-        sorting_dropdown.bind("<<ComboboxSelected>>", lambda e: self.update_sorting_method())
+        dropdown(display, 0, self.sorting_var, ["A-Z by Artist", "A-Z by Song Name", "Last Added"], self.update_sorting_method)
+        self.sort_order_button = ttk.Button(display, text="⬆ Ascending" if self.sort_ascending else "⬇ Descending",
+                                            width=13, command=self.toggle_sort_order)
+        self.sort_order_button.grid(row=0, column=2, padx=(8, 0), pady=6)
 
-        self.sort_order_asc = tk.BooleanVar(value=self.sort_ascending)
-        self.sort_order_button = ttk.Button(sorting_frame, text="⬆ Ascending" if self.sort_ascending else "⬇ Descending", command=self.toggle_sort_order)
-        self.sort_order_button.pack(side='left', padx=5)
-
-        theme_frame = ttk.Frame(display_frame)
-        theme_frame.pack(anchor="w", fill='x', padx=5, pady=5)
-        ttk.Label(theme_frame, text="Theme:").pack(side='left', padx=5)
-        theme_options = ["Dark Mode", "Light Mode"]
+        field_label(display, 1, "Theme")
         self.theme_var = tk.StringVar(value="Dark Mode" if self.dark_mode else "Light Mode")
-        theme_dropdown = ttk.Combobox(theme_frame, textvariable=self.theme_var, values=theme_options, state="readonly")
-        theme_dropdown.pack(side='left', padx=5)
-        theme_dropdown.bind("<<ComboboxSelected>>", lambda e: self.toggle_theme())
+        dropdown(display, 1, self.theme_var, ["Dark Mode", "Light Mode"], self.toggle_theme)
 
-        system_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(system_frame, text='System')
+        # Files
+        files = page('Files')
+        field_label(files, 0, "Save stems in")
+        self.folder_var = tk.StringVar(value=self.extract_folder)
+        ttk.Entry(files, textvariable=self.folder_var, state="readonly", width=30).grid(row=0, column=1, sticky='ew', pady=6)
+        ttk.Button(files, text="Browse...", command=self.choose_folder).grid(row=0, column=2, padx=(8, 0), pady=6)
 
-        folder_frame = ttk.Frame(system_frame)
-        folder_frame.pack(anchor="w", fill="x", pady=5)
-        ttk.Label(folder_frame, text="Save in:").pack(side="left", padx=5)
-        self.folder_label = ttk.Label(system_frame, text=self.extract_folder, wraplength=350, anchor="w", justify="left")
-        self.folder_label.pack(fill="x", padx=10, pady=2)
-        ttk.Button(folder_frame, text="Browse...", command=self.choose_folder).pack(side="left", padx=5)
+        field_label(files, 1, "File naming")
+        dropdown(files, 1, self.file_naming_var,
+                 ["Only Stem Type", "Song Name - Stem Type", "Artist Name - Song Name - Stem Type"], self.save_settings, columnspan=2)
 
-        auto_open_frame = ttk.Frame(system_frame)
-        auto_open_frame.pack(anchor="w", fill="x", padx=10, pady=5)
-        ttk.Label(auto_open_frame, text="Automatically open stems folder after extraction").pack(side="left", padx=5)
         self.auto_open_var = tk.BooleanVar(value=self.auto_open_folder)
-        auto_open_checkbox = ttk.Checkbutton(auto_open_frame, variable=self.auto_open_var, command=self.toggle_auto_open)
-        auto_open_checkbox.pack(side="left", padx=5)
+        ttk.Checkbutton(files, text="Open the stems folder after extraction", variable=self.auto_open_var,
+                        style="Switch.TCheckbutton", command=self.toggle_auto_open).grid(row=2, column=0, columnspan=3, sticky='w', pady=(12, 4))
 
-        # File naming frame in System tab
-        naming_frame = ttk.Frame(system_frame)
-        naming_frame.pack(anchor="w", pady=5, fill="x")
-        ttk.Label(naming_frame, text="File Naming:").pack(side="left", padx=5)
-        naming_options = ["Only Stem Type", "Song Name - Stem Type", "Artist Name - Song Name - Stem Type"]
-        naming_dropdown = ttk.Combobox(naming_frame, textvariable=self.file_naming_var, values=naming_options, state="readonly", width=35)
-        naming_dropdown.pack(side="left", padx=5)
-        naming_dropdown.bind("<<ComboboxSelected>>", lambda e: self.save_settings())
+        # Audio
+        audio = page('Audio')
+        field_label(audio, 0, "File format")
+        dropdown(audio, 0, self.file_format_var, ["wav", "flac", "mp3"], self.save_settings)
 
-        audio_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(audio_frame, text='Audio')
+        field_label(audio, 1, "Extracting method")
+        method_help = ttk.Label(audio, style="Muted.TLabel", wraplength=380, justify="left")
+        method_help.grid(row=2, column=0, columnspan=2, sticky='w', pady=(8, 0))
 
-        format_frame = ttk.Frame(audio_frame)
-        format_frame.pack(anchor="w", pady=5, fill="x")
-        ttk.Label(format_frame, text="File Saving Format:").pack(side="left", padx=5)
-        format_options = ["wav", "flac", "mp3"]
-        format_dropdown = ttk.Combobox(format_frame, textvariable=self.file_format_var, values=format_options, state="readonly")
-        format_dropdown.pack(side="left", padx=5)
-        format_dropdown.bind("<<ComboboxSelected>>", lambda e: self.save_settings())
+        def method_changed():
+            self.save_settings()
+            method_help.config(text={
+                "Stereo": "5 files - one stereo file per part (Drums, Bass, Lead, Vocals, Other).",
+                "Mono": "10 files - the left and right channel of every part separately.",
+                "Single File": "1 file - the whole song mixed down to stereo.",
+            }.get(self.extracting_method_var.get(), ""))
 
-        extracting_method_frame = ttk.Frame(audio_frame)
-        extracting_method_frame.pack(anchor="w", pady=5, fill="x")
-        ttk.Label(extracting_method_frame, text="Extracting Method:").pack(side="left", padx=5)
-        extracting_options = ["Stereo", "Mono", "Single File"]
-        extracting_dropdown = ttk.Combobox(extracting_method_frame, textvariable=self.extracting_method_var, values=extracting_options, state="readonly")
-        extracting_dropdown.pack(side="left", padx=5)
-        extracting_dropdown.bind("<<ComboboxSelected>>", lambda e: self.save_settings())
+        dropdown(audio, 1, self.extracting_method_var, ["Stereo", "Mono", "Single File"], method_changed)
+        method_changed()
 
-        about_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(about_frame, text='About & Help')
-
+        # About
+        about = page('About & Help')
+        about.columnconfigure(0, weight=1)
         if self.cached_logo:
-            logo_label = ttk.Label(about_frame, image=self.cached_logo)
-            logo_label.pack(pady=(5, 10))
-        else:
-            ttk.Label(about_frame, text="[Logo failed to load]", foreground="red").pack(pady=(5, 10))
-
-        about_text = "Fortnite Festival Extractor is an unofficial open-source\nprogram to download and extract FF songs into stems."
-        about_label = ttk.Label(about_frame, text=about_text, justify="center", anchor="center")
-        about_label.pack(pady=(0, 10))
-
-        github_link = ttk.Label(about_frame, text="Visit Fortnite Festival Extractor GitHub page", cursor="hand2", font=("TkDefaultFont", 10, "underline"))
-        github_link.pack(pady=(0, 10))
+            ttk.Label(about, image=self.cached_logo).grid(row=0, column=0, pady=(0, 10))
+        ttk.Label(about, text="Fortnite Festival Extractor is an unofficial open-source\nprogram to download and extract FF songs into stems.",
+                  justify="center").grid(row=1, column=0, pady=(0, 10))
+        github_link = ttk.Label(about, text="Visit the GitHub page", style="Link.TLabel", cursor="hand2")
+        github_link.grid(row=2, column=0, pady=(0, 10))
         github_link.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/ilayezra/Festival-Extractor"))
+        ttk.Label(about, text="Having issues? Contact me at ilayezra37@gmail.com", style="Muted.TLabel").grid(row=3, column=0)
 
-        contact_text = "If you have any issues, contact me at: ilayezra37@gmail.com"
-        contact_label = ttk.Label(about_frame, text=contact_text, justify="center", anchor="center")
-        contact_label.pack(pady=(0, 5))
+        ttk.Button(window, text="Close", style="Accent.TButton", width=10, command=window.destroy).pack(side='right', padx=12, pady=12)
 
-        button_frame = ttk.Frame(self.settings_window)
-        button_frame.pack(fill='x', side='bottom', pady=5)
-        ttk.Button(button_frame, text="OK", command=self.settings_window.destroy).pack(side='right', padx=5)
+        # Center over the main window
+        window.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - window.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - window.winfo_height()) // 3
+        window.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def toggle_auto_open(self):
         self.auto_open_folder = self.auto_open_var.get()
@@ -1375,9 +1352,8 @@ class FortniteTracksGUI:
         self.sort_ascending = not self.sort_ascending
         self.sort_order_button.config(text="⬆ Ascending" if self.sort_ascending else "⬇ Descending")
         self.save_settings()
-        self.song_listbox.selection_clear(0, tk.END)
         # Re-apply current search filter with new sorting
-        self.search_songs()  # This will re-filter and re-sort
+        self.search_songs()
 
     def toggle_theme(self):
         self.dark_mode = (self.theme_var.get() == "Dark Mode")
@@ -1385,30 +1361,41 @@ class FortniteTracksGUI:
         self.save_settings()
 
     def apply_theme(self):
-        bg_color = "#1E1E1E" if self.dark_mode else "#FFFFFF"
-        fg_color = "#FFFFFF" if self.dark_mode else "#000000"
-        listbox_bg = "#2E2E2E" if self.dark_mode else "#FFFFFF"
-        listbox_fg = "#FFFFFF" if self.dark_mode else "#000000"
-        progress_color = "#3A3A3A" if self.dark_mode else "#DDDDDD"
-        button_bg = "#3A3A3A" if self.dark_mode else "#DDDDDD"
+        """Switch the Sun Valley theme and re-create our styles (ttk styles are per theme)"""
+        sv_ttk.set_theme("dark" if self.dark_mode else "light")
 
-        self.root.configure(bg=bg_color)
-        self.style.configure("StatusLabel.TLabel", background=bg_color, foreground=fg_color)
-        self.status_label.configure(style="StatusLabel.TLabel")
-        self.song_listbox.configure(bg=listbox_bg, fg=listbox_fg)
-        self.queue_listbox.configure(bg=listbox_bg, fg=listbox_fg)
-        self.style.configure("TFrame", background=bg_color)
-        self.style.configure("TLabel", background=bg_color, foreground=fg_color)
-        self.style.configure("TButton", background=button_bg, foreground=fg_color)
-        self.style.configure("Horizontal.TProgressbar", background=progress_color, troughcolor=bg_color)
+        # sv-ttk calls tk_setPalette, which hard-codes a foreground on ttk widgets and hides
+        # style colors (muted text, placeholder). Keep new widgets clear of it and reset existing ones.
+        for widget_class in ("TLabel", "TEntry", "TButton", "TCheckbutton"):
+            self.root.option_add(f"*{widget_class}.foreground", "", "interactive")
+        self.root.after_idle(self.reset_widget_colors)
+
+        muted = "#a0a0a0" if self.dark_mode else "#5f5f5f"
+        link = "#57c8ff" if self.dark_mode else "#005fb8"
+        if not hasattr(self, "link_font"):
+            self.link_font = tkfont.nametofont("SunValleyBodyFont").copy()
+            self.link_font.configure(underline=True)
+        self.style.configure("Muted.TLabel", foreground=muted)
+        self.style.configure("Placeholder.TEntry", foreground=muted)
+        self.style.configure("Link.TLabel", foreground=link, font=self.link_font)
+        self.style.configure("Title.TLabel", font="SunValleySubtitleFont")
+        self.style.configure("Treeview", rowheight=30)
+
+    def reset_widget_colors(self, widget=None):
+        for child in (widget or self.root).winfo_children():
+            if child.winfo_class().startswith("T"):
+                try:
+                    child.configure(foreground="")
+                except tk.TclError:
+                    pass
+            self.reset_widget_colors(child)
 
     def choose_folder(self):
-        folder_selected = filedialog.askdirectory()
+        folder_selected = filedialog.askdirectory(parent=self.settings_window, initialdir=self.extract_folder)
         if folder_selected:
             self.extract_folder = folder_selected
-            self.folder_label.config(text=self.extract_folder)
+            self.folder_var.set(self.extract_folder)
             self.save_settings()
-            messagebox.showinfo("Folder Selected", f"Files will now save to:\n{self.extract_folder}")
 
     def save_settings(self):
         self.file_format = self.file_format_var.get()
@@ -1464,18 +1451,30 @@ class FortniteTracksGUI:
             self.root.after_cancel(self.search_after_id)
         self.search_after_id = self.root.after(150, self.search_songs)
 
+    def show_search_placeholder(self, event=None):
+        if not self.search_var.get():
+            self.search_placeholder_shown = True
+            self.search_entry.configure(style="Placeholder.TEntry")
+            self.search_var.set("Search songs or artists...")
+
+    def hide_search_placeholder(self, event=None):
+        if self.search_placeholder_shown:
+            self.search_placeholder_shown = False
+            self.search_entry.configure(style="TEntry")
+            self.search_var.set("")
+
+    def get_search_query(self):
+        return "" if self.search_placeholder_shown else self.search_var.get().strip().lower()
+
     def search_songs(self, event=None):
-        query = self.search_entry.get().lower()
-        
+        self.search_after_id = None
+        query = self.get_search_query()
+
         # Check for easter egg first
         if self.check_easter_egg(query):
-            self.search_entry.delete(0, tk.END)  # Clear the search box
-            # Reset to show all songs after easter egg
-            self.filtered_songs = self.songs.copy()
-            self.display_songs(self.filtered_songs)
-            return
-        
-        # Normal search functionality
+            self.search_var.set("")  # Clear the search box
+            query = ""
+
         if query:
             self.filtered_songs = [song for song in self.songs if query in song['title'].lower() or query in song['artist'].lower()]
         else:
@@ -1532,12 +1531,11 @@ class FortniteTracksGUI:
         if songs:
             self.search_songs()
         else:
-            self.song_listbox.delete(0, tk.END)
-            self.song_listbox.insert(tk.END, "Could not load songs - check your internet connection")
+            self.song_count_label.config(text="Could not load songs - check your internet connection")
 
     def display_songs(self, songs):
         sorted_songs = songs.copy()
-        
+
         if self.sorting_method == "A-Z by Artist":
             sorted_songs = sorted(sorted_songs, key=lambda s: s["artist"].lower(), reverse=not self.sort_ascending)
         elif self.sorting_method == "A-Z by Song Name":
@@ -1546,41 +1544,52 @@ class FortniteTracksGUI:
             sorted_songs = songs.copy()
             if self.sort_ascending != True:
                 sorted_songs.reverse()
-            
+
         self.filtered_songs = sorted_songs
-        self.song_listbox.delete(0, tk.END)
-        self.song_listbox.insert(tk.END, *[f"{song['artist']} - {song['title']}" for song in sorted_songs])
+        self.song_tree.delete(*self.song_tree.get_children())
+        for i, song in enumerate(sorted_songs):
+            self.song_tree.insert('', 'end', iid=str(i), values=(song['artist'], song['title']))
+
+        total = len(self.songs)
+        shown = len(sorted_songs)
+        self.song_count_label.config(text=f"{total:,} songs" if shown == total else f"{shown:,} of {total:,} songs")
 
     def seconds_to_minutes_seconds(self, seconds):
         minutes = seconds // 60
         seconds = seconds % 60
         return f"{minutes}:{seconds:02d}"
 
-    def is_song_in_queue(self, song):
-        """Check if song is already in queue"""
-        for queued_song in self.song_queue:
-            if queued_song['sid'] == song['sid']:
-                return True
-        return False
-
     def on_song_select(self, event=None):
-        selection = self.song_listbox.curselection()
-        if not selection or selection[0] >= len(self.filtered_songs):
+        selection = self.song_tree.selection()
+        if not selection or int(selection[0]) >= len(self.filtered_songs):
             return
-        selected_song = self.filtered_songs[selection[0]]
+        selected_song = self.filtered_songs[int(selection[0])]
 
-        # Check if Queue tab is currently selected
-        current_tab = self.notebook.select()
-        queue_tab_id = self.notebook.tabs()[1]  # Queue tab is the second tab (index 1)
-        
-        # If Queue tab is active, switch to Song Info tab
-        if current_tab == queue_tab_id:
-            self.notebook.select(0)  # Select Song Info tab (index 0)
-        
-        self.display_song_info(selected_song)
+        # Bring the Song tab forward if the Queue tab is showing
+        self.notebook.select(self.song_info_frame)
+        if selected_song is not self.current_song_info:
+            self.display_song_info(selected_song)
+
+    def show_empty_song_info(self):
+        for widget in self.song_info_frame.winfo_children():
+            widget.destroy()
+        ttk.Label(self.song_info_frame, text="Pick a song from the list\nto see its details",
+                  style="Muted.TLabel", justify="center").pack(expand=True)
+
+    def song_meta_line(self, song):
+        """'2013 · 4:08 · 116 BPM', skipping anything unknown"""
+        parts = []
+        if str(song['release_year']).isdigit():
+            parts.append(str(song['release_year']))
+        duration = song['duration'] if isinstance(song['duration'], int) else int(song['duration']) if str(song['duration']).isdigit() else 0
+        if duration:
+            parts.append(self.seconds_to_minutes_seconds(duration))
+        if str(song['bpm']).isdigit():
+            parts.append(f"{song['bpm']} BPM")
+        return "  ·  ".join(parts)
 
     def display_song_info(self, song):
-        """Display song information in the Song Info tab"""
+        """Display song information in the Song tab"""
         # Stop any current preview when switching songs (a refresh of the same song keeps it playing)
         same_song = song is self.current_song_info
         if not same_song:
@@ -1594,50 +1603,53 @@ class FortniteTracksGUI:
 
         if song['cover_art_url']:
             cover_label = ttk.Label(self.song_info_frame)
-            cover_label.pack(pady=10)
+            cover_label.pack(pady=(4, 12))
             self.load_cover_art(song['cover_art_url'], cover_label)
-        
-        duration = song['duration'] if isinstance(song['duration'], int) else int(song['duration']) if song['duration'].isdigit() else 0
-        formatted_duration = self.seconds_to_minutes_seconds(duration)
-        
-        details = [
-            f"Title: {song['title']}",
-            f"Artist: {song['artist']}",
-            f"Release Year: {song['release_year']}",
-            f"Duration: {formatted_duration}",
-            f"BPM: {song['bpm']}"
-        ]
-        for detail in details:
-            ttk.Label(self.song_info_frame, text=detail).pack(anchor="w", pady=2)
-        
-        # Check if FFmpeg is ready before showing buttons
-        if not self.ffmpeg_ready:
-            self.show_ffmpeg_loading_message()
+
+        ttk.Label(self.song_info_frame, text=song['title'], style="Title.TLabel", wraplength=330, justify="center").pack()
+        ttk.Label(self.song_info_frame, text=song['artist'], style="Muted.TLabel", wraplength=330, justify="center").pack()
+        ttk.Label(self.song_info_frame, text=self.song_meta_line(song), style="Muted.TLabel").pack(pady=(4, 14))
+
+        entry = self.find_queue_entry(song)
+        status = entry['status'] if entry else None
+
+        if status == 'Downloading':
+            download_text = "Downloading..."
+        elif status == 'Waiting' and self.downloading:
+            download_text = "Waiting in queue..."
         else:
-            # Add to queue button
-            if self.is_song_in_queue(song):
-                add_button = ttk.Button(self.song_info_frame, text="Already in Queue", state="disabled")
-            else:
-                add_button = ttk.Button(self.song_info_frame, text="Add to Queue", command=lambda: self.add_to_queue(song))
-            add_button.pack(pady=10)
-        
+            download_text = {'Done': "⬇  Download Again", 'Failed': "⬇  Retry"}.get(status, "⬇  Download")
+        download_button = ttk.Button(self.song_info_frame, text=download_text, style="Accent.TButton",
+                                     command=lambda: self.download_now(song))
+        download_button.pack(fill=tk.X, padx=10)
+        if status == 'Downloading' or (status == 'Waiting' and self.downloading):
+            download_button.state(['disabled'])
+
+        buttons = ttk.Frame(self.song_info_frame)
+        buttons.pack(fill=tk.X, padx=10, pady=(8, 0))
+        in_queue = status in ('Waiting', 'Downloading')
+        add_button = ttk.Button(buttons, text="✓  In Queue" if in_queue else "+  Add to Queue",
+                                command=lambda: self.add_to_queue(song))
+        if in_queue:
+            add_button.state(['disabled'])
+
         # Check if this is an Epic Games song
         if self.is_epic_games_song(song['artist']):
-            # Show Epic Games message
-            epic_label = ttk.Label(self.song_info_frame, text="Preview not available for Epic Games original tracks",
-                                    font=("Arial", 9), foreground="gray")
-            epic_label.pack(pady=(10, 0))
+            add_button.pack(fill=tk.X)
+            ttk.Label(self.song_info_frame, text="Preview not available for Epic Games original tracks",
+                      style="Muted.TLabel", wraplength=330, justify="center").pack(pady=(10, 0))
         else:
+            add_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
             playing = same_song and self.preview_system.is_playing_status()
 
-            # Single toggle button (centered like Add to Queue)
-            self.preview_button = ttk.Button(self.song_info_frame, text="⏹ Stop Preview" if playing else "▶ Play Preview",
-                                                command=lambda: self.toggle_preview(song))
-            self.preview_button.pack(pady=(10, 0))
+            self.preview_button = ttk.Button(buttons, text="⏹  Stop" if playing else "▶  Preview",
+                                             command=lambda: self.toggle_preview(song))
+            self.preview_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
-            # Preview status label (below button, centered)
-            self.preview_status = ttk.Label(self.song_info_frame, text="Playing 30s preview..." if playing else "", font=("Arial", 9))
-            self.preview_status.pack(pady=(2, 0))
+            # Preview status label (below the buttons)
+            self.preview_status = ttk.Label(self.song_info_frame, text="Playing 30s preview..." if playing else "",
+                                            style="Muted.TLabel")
+            self.preview_status.pack(pady=(8, 0))
 
     def load_cover_art(self, url, label):
         """Show cover art from the cache, or download it in the background"""
@@ -1673,23 +1685,9 @@ class FortniteTracksGUI:
             label.config(image=label.image)
 
     def update_song_info_display(self):
-        """Update the song info display to refresh button state"""
-        selection = self.song_listbox.curselection()
-        if selection and selection[0] < len(self.filtered_songs):
-            selected_song = self.filtered_songs[selection[0]]
-            self.display_song_info(selected_song)
-
-    def show_ffmpeg_loading_message(self):
-        """Show loading message when FFmpeg is not ready"""
-        loading_frame = ttk.Frame(self.song_info_frame)
-        loading_frame.pack(pady=(20, 10))
-        
-        ttk.Label(loading_frame, text="⏳ Setting up audio tools...", 
-                font=("Arial", 11, "bold")).pack()
-        ttk.Label(loading_frame, text="Please wait while we download required components.", 
-                font=("Arial", 9)).pack()
-        ttk.Label(loading_frame, text="This only happens on first run.", 
-                font=("Arial", 9), foreground="gray").pack()
+        """Refresh the Song tab (button states follow the queue)"""
+        if self.current_song_info is not None:
+            self.display_song_info(self.current_song_info)
 
     def sanitize_folder_name(self, name):
         return re.sub(r'[<>:"/\\|?*]', '', name)
