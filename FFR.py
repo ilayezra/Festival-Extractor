@@ -23,6 +23,7 @@ import urllib.request
 import zipfile
 import tarfile
 import stat
+os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
 import pygame
 from urllib.parse import quote, urlsplit, urlunsplit
 from concurrent.futures import ThreadPoolExecutor
@@ -30,18 +31,22 @@ import struct
 import math
 import time
 import random
+from requests.adapters import HTTPAdapter
+
+# One shared session so connections to the same servers are reused
+http = requests.Session()
+http.mount('https://', HTTPAdapter(pool_connections=10, pool_maxsize=16))
+http.mount('http://', HTTPAdapter(pool_connections=10, pool_maxsize=16))
 
 class SmartPreviewSystem:
     def __init__(self):
-        self.current_url = None
         self.is_playing = False
-        self.position = 0
-        self.parent_app = None
-        self.current_temp_file = None
-        
+        self.current_audio = None
+        self.preview_cache = {}  # (artist, title) -> mp3 bytes
+
         # Initialize pygame mixer for audio playback
         try:
-            pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
         except pygame.error as e:
             print(f"Audio initialization failed: {e}")
 
@@ -120,7 +125,7 @@ class SmartPreviewSystem:
         for strategy in search_strategies:
             try:
                 url = f"https://api.deezer.com/search?q={quote(strategy)}&limit=50"
-                response = requests.get(url, timeout=10)
+                response = http.get(url, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -165,88 +170,44 @@ class SmartPreviewSystem:
         print(f"❌ No preview found for: '{clean_artist}' - '{clean_title}'")
         return None
 
-    def play_preview(self, preview_url):
-        """Play 30-second preview from URL"""
-        try:
-            if self.is_playing:
-                self.stop()
-            
-            # Download the preview temporarily
-            response = requests.get(preview_url, timeout=15)
+    def fetch_preview(self, artist, title):
+        """Find and download a song's 30-second preview (runs in a background thread)"""
+        key = (artist.strip().lower(), title.strip().lower())
+        if key not in self.preview_cache:
+            preview_url = self.search_preview_ultimate(artist, title)
+            if not preview_url:
+                return None
+            response = http.get(preview_url, timeout=15)
             response.raise_for_status()
-            
-            # Use unique filenames to avoid conflicts
-            timestamp = str(int(time.time() * 1000))  # milliseconds timestamp
-            temp_mp3_file = f"temp_preview_{timestamp}.mp3"
-            temp_wav_file = f"temp_preview_{timestamp}.wav"
-            
-            # Write the downloaded content
-            with open(temp_mp3_file, 'wb') as f:
-                f.write(response.content)
-            
-            # Convert MP3 to WAV using FFmpeg for better compatibility
-            ffmpeg_path = getattr(self.parent_app, 'ffmpeg_path', 'ffmpeg')
-            
-            # Convert to WAV
-            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            subprocess.run([
-                ffmpeg_path, '-y', '-i', temp_mp3_file, 
-                '-acodec', 'pcm_s16le', '-ar', '22050', '-ac', '2',
-                temp_wav_file
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
-            
-            # Clean up the MP3 file
-            os.remove(temp_mp3_file)
-            
-            # Play the WAV file
-            pygame.mixer.music.load(temp_wav_file)
-            pygame.mixer.music.play()
-            self.is_playing = True
-            self.current_url = preview_url
-            self.current_temp_file = temp_wav_file  # Store for cleanup
-                
-            # Clean up temp file after a delay
-            def cleanup():
-                time.sleep(40)  # Wait for playback to complete
-                try:
-                    if os.path.exists(temp_wav_file):
-                        os.remove(temp_wav_file)
-                except:
-                    pass
-            
-            threading.Thread(target=cleanup, daemon=True).start()
-            
-        except Exception as e:
-            print(f"Error playing preview: {e}")
-            # Clean up on error
-            try:
-                if 'temp_mp3_file' in locals() and os.path.exists(temp_mp3_file):
-                    os.remove(temp_mp3_file)
-                if 'temp_wav_file' in locals() and os.path.exists(temp_wav_file):
-                    os.remove(temp_wav_file)
-            except:
-                pass
-            raise e
-    
+            if len(self.preview_cache) >= 20:
+                self.preview_cache.pop(next(iter(self.preview_cache)))
+            self.preview_cache[key] = response.content
+        return self.preview_cache[key]
+
+    def play_preview(self, audio):
+        """Play preview mp3 bytes straight from memory"""
+        self.stop()
+        self.current_audio = BytesIO(audio)
+        pygame.mixer.music.load(self.current_audio, 'mp3')
+        pygame.mixer.music.play()
+        self.is_playing = True
+
     def stop(self):
         """Stop current playback"""
         try:
             pygame.mixer.music.stop()
             pygame.mixer.music.unload()
-            self.is_playing = False
-            
-            # Clean up current temp file if it exists
-            if hasattr(self, 'current_temp_file') and self.current_temp_file and os.path.exists(self.current_temp_file):
-                try:
-                    os.remove(self.current_temp_file)
-                except:
-                    pass
-        except:
+        except pygame.error:
             pass
-    
+        self.is_playing = False
+        self.current_audio = None
+
     def is_playing_status(self):
         """Check if currently playing"""
-        return pygame.mixer.music.get_busy() and self.is_playing
+        try:
+            return pygame.mixer.music.get_busy() and self.is_playing
+        except pygame.error:
+            return False
 
 class FortniteTracksGUI:
     def __init__(self, root):
@@ -264,9 +225,14 @@ class FortniteTracksGUI:
         
         # Initialize preview system
         self.preview_system = SmartPreviewSystem()
-        self.preview_system.parent_app = self
+        self.auto_stop_id = None
+        self.current_song_info = None
 
-        # Register cleanup to delete WAV files when app closes
+        self.cover_cache = {}  # cover url -> PhotoImage
+        self.cover_placeholder = tk.PhotoImage(width=200, height=200)
+        self.search_after_id = None
+
+        # Stop audio cleanly when the app closes
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         settings = self.load_settings()
@@ -312,7 +278,7 @@ class FortniteTracksGUI:
         ttk.Label(search_frame, text="Search Song:").pack(side=tk.LEFT, padx=(0, 5))
         self.search_entry = ttk.Entry(search_frame, width=50)
         self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.search_entry.bind("<KeyRelease>", self.search_songs)
+        self.search_entry.bind("<KeyRelease>", self.schedule_search)
 
         list_frame = ttk.Frame(left_frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -388,9 +354,11 @@ class FortniteTracksGUI:
         # Initialize FFmpeg first
         self.setup_ffmpeg()
         
-        self.songs = self.fetch_and_extract_songs()
-        self.filtered_songs = self.songs
-        self.display_songs(self.filtered_songs)
+        # Load the song list in the background so the window opens right away
+        self.songs = []
+        self.filtered_songs = []
+        self.song_listbox.insert(tk.END, "Loading songs...")
+        threading.Thread(target=self.load_songs_worker, daemon=True).start()
 
         # Start checking the download queue
         self.check_download_queue()
@@ -573,119 +541,64 @@ class FortniteTracksGUI:
         
         return clean_artist in epic_variants
 
-    def delete_all_wav_files(self):
-        """Delete all WAV files with 'temp' in the name when program closes"""
-        try:
-            import glob
-            
-            # Stop any playing audio first
-            if hasattr(self, 'preview_system'):
-                self.preview_system.stop()
-            
-            # Wait for pygame to release files
-            time.sleep(1)
-            
-            # Find and delete only WAV files with 'temp' in their name
-            wav_files = glob.glob("*temp*.wav")
-            deleted_count = 0
-            
-            for wav_file in wav_files:
-                try:
-                    if os.path.exists(wav_file):
-                        os.remove(wav_file)
-                        deleted_count += 1
-                        print(f"Deleted: {wav_file}")
-                except Exception as e:
-                    print(f"Could not delete {wav_file}: {e}")
-            
-            if deleted_count > 0:
-                print(f"Deleted {deleted_count} temporary WAV files")
-            
-        except Exception as e:
-            print(f"Error deleting temporary WAV files: {e}")
-
     def on_closing(self):
-        """Handle app closing - delete all WAV files"""
-        print("Closing application and deleting WAV files...")
-        
-        # Delete all WAV files
-        self.delete_all_wav_files()
-        
-        # Close the application
+        """Handle app closing"""
+        self.preview_system.stop()
         self.root.destroy()
 
     def play_song_preview(self, song):
-        """Play 30-second preview of the song"""
-        if hasattr(self, 'preview_button'):
-            self.preview_button.config(state="disabled")
-        try:
-            if hasattr(self, 'preview_status'):
-                self.preview_status.config(text="Searching for preview...")
-            
-            # Search for preview in a background thread
-            def search_and_play():
-                preview_url = self.preview_system.search_preview_ultimate(song['artist'], song['title'])
-                
-                if preview_url:
-                    # Update UI in main thread
-                    self.root.after(0, lambda: self.start_preview_playback(preview_url))
-                else:
-                    self.root.after(0, lambda: self.preview_not_found())
-            
-            threading.Thread(target=search_and_play, daemon=True).start()
-            
-        except Exception as e:
-            if hasattr(self, 'preview_status'):
-                self.preview_status.config(text="Preview error")
-            if hasattr(self, 'preview_button'):
-                self.preview_button.config(text="▶ Play Preview", state="normal")
-            print(f"Preview error: {e}")
+        """Find, download and play the 30-second preview without blocking the UI"""
+        self.preview_button.config(state="disabled")
+        self.preview_status.config(text="Searching for preview...")
 
-    def start_preview_playback(self, preview_url):
+        def worker():
+            try:
+                audio = self.preview_system.fetch_preview(song['artist'], song['title'])
+            except Exception as e:
+                print(f"Preview error: {e}")
+                audio = None
+            self.run_on_ui(lambda: self.start_preview_playback(song, audio))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_preview_playback(self, song, audio):
         """Start playing the preview"""
-        try:
-            self.preview_system.play_preview(preview_url)
-            if hasattr(self, 'preview_status'):
-                self.preview_status.config(text="Playing 30s preview...")
-            if hasattr(self, 'preview_button'):
-                self.preview_button.config(text="⏹ Stop Preview", state="normal")
-            
-            # Cancel any existing auto-stop timer
-            if hasattr(self, 'auto_stop_timer'):
-                try:
-                    self.auto_stop_timer.cancel()
-                except:
-                    pass
-            
-            # Auto-stop after 30 seconds
-            def auto_stop_check():
-                self.stop_preview()
+        # The user moved on to another song while this one was loading
+        if song is not self.current_song_info:
+            return
+        if not audio:
+            self.preview_not_found()
+            return
 
-            self.auto_stop_timer = threading.Timer(30.0, auto_stop_check)
-            self.auto_stop_timer.daemon = True
-            self.auto_stop_timer.start()
-            
+        try:
+            self.preview_system.play_preview(audio)
         except Exception as e:
-            if hasattr(self, 'preview_status'):
-                self.preview_status.config(text="Playback failed")
-            if hasattr(self, 'preview_button'):
-                self.preview_button.config(text="▶ Play Preview", state="normal")
             print(f"Playback error: {e}")
+            self.preview_status.config(text="Playback failed")
+            self.preview_button.config(text="▶ Play Preview", state="normal")
+            return
+
+        self.preview_status.config(text="Playing 30s preview...")
+        self.preview_button.config(text="⏹ Stop Preview", state="normal")
+
+        # Auto-stop after 30 seconds
+        self.cancel_auto_stop()
+        self.auto_stop_id = self.root.after(30000, self.stop_preview)
+
+    def cancel_auto_stop(self):
+        if self.auto_stop_id:
+            self.root.after_cancel(self.auto_stop_id)
+            self.auto_stop_id = None
 
     def stop_preview(self):
         """Stop preview playback"""
-        # Cancel auto-stop timer
-        if hasattr(self, 'auto_stop_timer'):
-            try:
-                self.auto_stop_timer.cancel()
-            except:
-                pass
-        
+        self.cancel_auto_stop()
         self.preview_system.stop()
-        if hasattr(self, 'preview_status'):
+        try:
             self.preview_status.config(text="")
-        if hasattr(self, 'preview_button'):
             self.preview_button.config(text="▶ Play Preview", state="normal")
+        except (AttributeError, tk.TclError):
+            pass
 
     def toggle_preview(self, song):
         """Toggle preview playback"""
@@ -698,16 +611,14 @@ class FortniteTracksGUI:
 
     def preview_not_found(self):
         """Handle when no preview is found"""
-        if hasattr(self, 'preview_status'):
-            self.preview_status.config(text="No preview available")
-        if hasattr(self, 'preview_button'):
-            self.preview_button.config(text="▶ Play Preview", state="normal")
+        self.preview_status.config(text="No preview available")
+        self.preview_button.config(text="▶ Play Preview", state="normal")
 
     def download_with_progress(self, url, output_path, start_progress, end_progress):
         """Download file with progress updates"""
-        response = requests.get(url, stream=True)
+        response = http.get(url, stream=True, timeout=30)
         response.raise_for_status()
-        
+
         total_size = int(response.headers.get('content-length', 0))
         downloaded_size = 0
         
@@ -742,12 +653,20 @@ class FortniteTracksGUI:
                         self.download_next_in_queue()
                     else:
                         self.queue_download_complete()
-                self.root.update_idletasks()
+                elif message['type'] == 'call':
+                    try:
+                        message['func']()
+                    except Exception as e:
+                        print(f"UI update failed: {e}")
         except queue.Empty:
             pass
         
         # Schedule next check
         self.root.after(100, self.check_download_queue)
+
+    def run_on_ui(self, func):
+        """Run func on the Tk thread (Tk widgets must not be touched from worker threads)"""
+        self.download_queue_thread.put({'type': 'call', 'func': func})
 
     def update_progress(self, value):
         """Thread-safe progress update"""
@@ -824,12 +743,14 @@ class FortniteTracksGUI:
 
     def update_queue_display(self):
         """Update the queue listbox display"""
-        self.queue_listbox.delete(0, tk.END)
+        items = []
         for i, song in enumerate(self.song_queue):
             display_text = f"{i+1}. {song['artist']} - {song['title']}"
             if self.downloading and i == self.current_download_index:
                 display_text += " (Downloading...)"
-            self.queue_listbox.insert(tk.END, display_text)
+            items.append(display_text)
+        self.queue_listbox.delete(0, tk.END)
+        self.queue_listbox.insert(tk.END, *items)
 
     def on_queue_select(self, event=None):
         """Handle queue selection - switch to song info tab and show selected song"""
@@ -946,7 +867,7 @@ class FortniteTracksGUI:
         headers = {'Range': f"bytes={byte_range[0]}-{byte_range[1]}"} if byte_range else None
         for attempt in range(1, retries + 1):
             try:
-                r = requests.get(url, headers=headers, timeout=30)
+                r = http.get(url, headers=headers, timeout=30)
                 r.raise_for_status()
                 if byte_range and r.status_code == 200:
                     # Server ignored the Range header and sent the whole file
@@ -1137,9 +1058,9 @@ class FortniteTracksGUI:
         raise Exception("MPD has no downloadable audio")
 
     def download_segments(self, segments, numbered, out):
-        """Download segments 5 at a time and append them to out in order"""
+        """Download segments 8 at a time and append them to out in order"""
         total = len(segments)
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(self.http_get, url, byte_range) for url, byte_range in segments]
             try:
                 missing_from = None
@@ -1243,7 +1164,7 @@ class FortniteTracksGUI:
             self.update_status("Getting song info...")
             self.update_progress(0)
             
-            response = requests.get(api_url)
+            response = http.get(api_url, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -1263,7 +1184,7 @@ class FortniteTracksGUI:
                         self.update_status("Downloading song data...")
                         self.update_progress(2)
                         
-                        with requests.get(download_url, stream=True) as r:
+                        with http.get(download_url, stream=True, timeout=30) as r:
                             r.raise_for_status()
                             total_size = int(r.headers.get('content-length', 0))
                             downloaded_size = 0
@@ -1537,6 +1458,12 @@ class FortniteTracksGUI:
             return os.path.join(sys._MEIPASS, relative_path)
         return relative_path
 
+    def schedule_search(self, event=None):
+        """Filter once typing pauses instead of on every key"""
+        if self.search_after_id:
+            self.root.after_cancel(self.search_after_id)
+        self.search_after_id = self.root.after(150, self.search_songs)
+
     def search_songs(self, event=None):
         query = self.search_entry.get().lower()
         
@@ -1557,7 +1484,7 @@ class FortniteTracksGUI:
 
     def fetch_json_data(self, url):
         try:
-            response = requests.get(url)
+            response = http.get(url, timeout=15)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -1596,6 +1523,18 @@ class FortniteTracksGUI:
         print(f"Songs fetched: {len(songs)}")
         return songs
 
+    def load_songs_worker(self):
+        songs = self.fetch_and_extract_songs()
+        self.run_on_ui(lambda: self.songs_loaded(songs))
+
+    def songs_loaded(self, songs):
+        self.songs = songs
+        if songs:
+            self.search_songs()
+        else:
+            self.song_listbox.delete(0, tk.END)
+            self.song_listbox.insert(tk.END, "Could not load songs - check your internet connection")
+
     def display_songs(self, songs):
         sorted_songs = songs.copy()
         
@@ -1610,9 +1549,7 @@ class FortniteTracksGUI:
             
         self.filtered_songs = sorted_songs
         self.song_listbox.delete(0, tk.END)
-        for song in sorted_songs:
-            self.song_listbox.insert(tk.END, f"{song['artist']} - {song['title']}")
-        self.song_listbox.update_idletasks()
+        self.song_listbox.insert(tk.END, *[f"{song['artist']} - {song['title']}" for song in sorted_songs])
 
     def seconds_to_minutes_seconds(self, seconds):
         minutes = seconds // 60
@@ -1628,10 +1565,10 @@ class FortniteTracksGUI:
 
     def on_song_select(self, event=None):
         selection = self.song_listbox.curselection()
-        if not selection:
+        if not selection or selection[0] >= len(self.filtered_songs):
             return
         selected_song = self.filtered_songs[selection[0]]
-        
+
         # Check if Queue tab is currently selected
         current_tab = self.notebook.select()
         queue_tab_id = self.notebook.tabs()[1]  # Queue tab is the second tab (index 1)
@@ -1644,31 +1581,21 @@ class FortniteTracksGUI:
 
     def display_song_info(self, song):
         """Display song information in the Song Info tab"""
-        # Stop any current preview when switching songs
-        if hasattr(self, 'preview_system'):
-            # Cancel auto-stop timer
-            if hasattr(self, 'auto_stop_timer'):
-                try:
-                    self.auto_stop_timer.cancel()
-                except:
-                    pass
+        # Stop any current preview when switching songs (a refresh of the same song keeps it playing)
+        same_song = song is self.current_song_info
+        if not same_song:
+            self.cancel_auto_stop()
             self.preview_system.stop()
-        
+        self.current_song_info = song
+
         # Clear existing widgets in song info frame
         for widget in self.song_info_frame.winfo_children():
             widget.destroy()
-        
+
         if song['cover_art_url']:
-            try:
-                response = requests.get(song['cover_art_url'])
-                image = Image.open(BytesIO(response.content))
-                image = image.resize((200, 200), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(image)
-                label = ttk.Label(self.song_info_frame, image=photo)
-                label.image = photo
-                label.pack(pady=10)
-            except:
-                ttk.Label(self.song_info_frame, text="No Image Available").pack(pady=10)
+            cover_label = ttk.Label(self.song_info_frame)
+            cover_label.pack(pady=10)
+            self.load_cover_art(song['cover_art_url'], cover_label)
         
         duration = song['duration'] if isinstance(song['duration'], int) else int(song['duration']) if song['duration'].isdigit() else 0
         formatted_duration = self.seconds_to_minutes_seconds(duration)
@@ -1694,28 +1621,61 @@ class FortniteTracksGUI:
                 add_button = ttk.Button(self.song_info_frame, text="Add to Queue", command=lambda: self.add_to_queue(song))
             add_button.pack(pady=10)
         
-        # Only show preview button if FFmpeg is ready
-        if self.ffmpeg_ready:
-                # Check if this is an Epic Games song
-            if self.is_epic_games_song(song['artist']):
-                    # Show Epic Games message
-                epic_label = ttk.Label(self.song_info_frame, text="Preview not available for Epic Games original tracks", 
-                                        font=("Arial", 9), foreground="gray")
-                epic_label.pack(pady=(10, 0))
-            else:
-                    # Single toggle button (centered like Add to Queue)
-                self.preview_button = ttk.Button(self.song_info_frame, text="▶ Play Preview", 
-                                                    command=lambda: self.toggle_preview(song))
-                self.preview_button.pack(pady=(10, 0))
+        # Check if this is an Epic Games song
+        if self.is_epic_games_song(song['artist']):
+            # Show Epic Games message
+            epic_label = ttk.Label(self.song_info_frame, text="Preview not available for Epic Games original tracks",
+                                    font=("Arial", 9), foreground="gray")
+            epic_label.pack(pady=(10, 0))
+        else:
+            playing = same_song and self.preview_system.is_playing_status()
 
-                    # Preview status label (below button, centered)
-                self.preview_status = ttk.Label(self.song_info_frame, text="", font=("Arial", 9))
-                self.preview_status.pack(pady=(2, 0))
+            # Single toggle button (centered like Add to Queue)
+            self.preview_button = ttk.Button(self.song_info_frame, text="⏹ Stop Preview" if playing else "▶ Play Preview",
+                                                command=lambda: self.toggle_preview(song))
+            self.preview_button.pack(pady=(10, 0))
+
+            # Preview status label (below button, centered)
+            self.preview_status = ttk.Label(self.song_info_frame, text="Playing 30s preview..." if playing else "", font=("Arial", 9))
+            self.preview_status.pack(pady=(2, 0))
+
+    def load_cover_art(self, url, label):
+        """Show cover art from the cache, or download it in the background"""
+        if url in self.cover_cache:
+            label.image = self.cover_cache[url]
+            label.config(image=label.image)
+            return
+        label.config(image=self.cover_placeholder)
+
+        def worker():
+            try:
+                image = Image.open(BytesIO(http.get(url, timeout=10).content))
+                image = image.resize((200, 200), Image.LANCZOS)
+            except Exception:
+                image = None
+            self.run_on_ui(lambda: self.show_cover_art(url, image, label))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_cover_art(self, url, image, label):
+        if image is not None:
+            if len(self.cover_cache) >= 100:
+                self.cover_cache.pop(next(iter(self.cover_cache)))
+            self.cover_cache[url] = ImageTk.PhotoImage(image)
+        # The label is gone if the user already picked another song
+        if not label.winfo_exists():
+            return
+        if image is None:
+            label.config(image='', text="No Image Available")
+        else:
+            # Keep a reference on the label so a cache eviction can't blank it
+            label.image = self.cover_cache[url]
+            label.config(image=label.image)
 
     def update_song_info_display(self):
         """Update the song info display to refresh button state"""
         selection = self.song_listbox.curselection()
-        if selection:
+        if selection and selection[0] < len(self.filtered_songs):
             selected_song = self.filtered_songs[selection[0]]
             self.display_song_info(selected_song)
 
