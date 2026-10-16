@@ -1,13 +1,25 @@
 # Builds Festival Extractor for Windows, macOS and Linux.
 # - On pull requests / manual runs: the builds are attached to the run as artifacts.
-# - On a pushed tag (e.g. 2.0.0): a draft release with all builds is created.
+# - Manual run with a release version (e.g. 1.3.0): after every build passes its self-test,
+#   a draft release with all builds is created. Publishing it creates the tag.
 name: Build
 
 on:
-  push:
-    tags: ['*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release version (e.g. 1.3.0) - leave empty for a test build'
+        required: false
+        default: ''
+      release_title:
+        description: 'Release title'
+        required: false
+        default: ''
+      release_notes:
+        description: 'Release notes (Markdown, can also be edited on the draft)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -67,21 +79,12 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
-  # Runs only when every build and self-test passed. The release title and notes
-  # come from the annotated tag: first line = title, the rest = notes.
+  # Runs only when every build and self-test passed
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Read release notes from the tag
-        run: |
-          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
-          git tag -l --format='%(contents:subject)' "${{ github.ref_name }}" > title.txt
-          git tag -l --format='%(contents:body)' "${{ github.ref_name }}" > notes.md
-
       - uses: actions/download-artifact@v4
         with:
           path: assets
@@ -90,9 +93,14 @@ jobs:
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          TITLE: ${{ inputs.release_title }}
+          NOTES: ${{ inputs.release_notes }}
         run: |
-          gh release create "${{ github.ref_name }}" assets/* \
+          printf '%s\n' "$NOTES" > notes.md
+          gh release create "$TAG" assets/* \
             --repo "${{ github.repository }}" \
-            --title "$(cat title.txt)" \
+            --target "${{ github.sha }}" \
+            --title "${TITLE:-$TAG}" \
             --notes-file notes.md \
             --draft
