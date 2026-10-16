@@ -12,7 +12,7 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
 ✅ **Customizable settings**, including extraction folder and sorting options  
 
 ## 📸 Screenshot
-![Fortnite Festival Extractor](https://us-east-1.tixte.net/uploads/milki.tixte.co/Example_(2).png)
+![Fortnite Festival Extractor](https://us-east-1.tixte.net/uploads/milki.tixte.co/promo.png)
 
 ## 🔧 Installation
 
