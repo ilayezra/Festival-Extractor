@@ -51,11 +51,21 @@ def settings_path():
     """settings.json lives in the user's app data folder, not next to the program"""
     if os.name == 'nt':
         base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    elif sys.platform == 'darwin':
+        base = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
     else:
         base = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('~'), '.config')
     folder = os.path.join(base, 'Festival Extractor')
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, 'settings.json')
+
+
+def default_extract_folder():
+    """The folder the program runs from, unless it can't be written to (a macOS app starts in /)"""
+    folder = os.getcwd()
+    if folder != os.path.abspath(os.sep) and os.access(folder, os.W_OK):
+        return folder
+    return os.path.join(os.path.expanduser('~'), 'Music', 'Festival Extractor')
 
 
 # One shared session so connections to the same servers are reused
@@ -261,7 +271,7 @@ class FortniteTracksGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         settings = self.load_settings()
-        self.extract_folder = settings.get("extract_folder", os.getcwd())
+        self.extract_folder = settings.get("extract_folder", default_extract_folder())
         self.dark_mode = settings.get("dark_mode", True)
         self.sorting_method = settings.get("sorting_method", "Last Added")
         self.sort_ascending = settings.get("sort_ascending", True)
@@ -1215,7 +1225,7 @@ class FortniteTracksGUI:
             with open(settings_file, "r") as f:
                 settings = json.load(f)
                 return {
-                    "extract_folder": settings.get("extract_folder", os.getcwd()),
+                    "extract_folder": settings.get("extract_folder", default_extract_folder()),
                     "dark_mode": settings.get("dark_mode", True),
                     "sorting_method": settings.get("sorting_method", "Last Added"),
                     "sort_ascending": settings.get("sort_ascending", True),
@@ -1225,7 +1235,7 @@ class FortniteTracksGUI:
                     "file_naming": settings.get("file_naming", "Only Stem Type")
                 }
         return {
-            "extract_folder": os.getcwd(),
+            "extract_folder": default_extract_folder(),
             "dark_mode": True,
             "sorting_method": "Last Added",
             "sort_ascending": True,
@@ -1597,7 +1607,38 @@ class FortniteTracksGUI:
                 subprocess.Popen(["xdg-open", stem_folder])
 
 
+def self_test():
+    """Check that a built program has everything it needs - run by the release build on every platform"""
+    try:
+        for name in ("keys.bin", "icon.png", "logo.png"):
+            if not os.path.exists(resource_path(name)):
+                raise Exception(f"missing bundled file: {name}")
+
+        with tempfile.TemporaryDirectory() as folder:
+            for file_format, codec in AUDIO_CODECS.items():
+                with av.open(os.path.join(folder, f"test.{file_format}"), 'w') as container:
+                    stream = container.add_stream(codec, rate=48000, layout='stereo')
+                    frame = av.AudioFrame.from_ndarray(np.zeros((1, 2 * 4800), dtype=np.float32), format='flt', layout='stereo')
+                    frame.sample_rate = 48000
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                    for packet in stream.encode(None):
+                        container.mux(packet)
+
+        root = tk.Tk()
+        sv_ttk.set_theme("dark")
+        root.destroy()
+    except Exception as e:
+        print(f"self-test failed: {e}")
+        sys.exit(1)
+    print("self-test ok")
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        self_test()
+
     root = tk.Tk()
     app = FortniteTracksGUI(root)
     root.mainloop()

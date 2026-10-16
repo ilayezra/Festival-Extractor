@@ -16,18 +16,26 @@ An advanced GUI-based tool that allows you to extract and download music tracks 
 
 ## 🔧 Installation
 
-### Windows
-1. Download the latest **[Release](https://github.com/ilayezra/Festival-Extractor/releases)**
-2. Run `Festival Extractor`
+Download the file for your system from the latest **[Release](https://github.com/ilayezra/Festival-Extractor/releases)** and unzip it.
+Everything the program needs is built in - no ffmpeg or other files to install.
 
-Everything is inside the single `Festival Extractor.exe` - no ffmpeg or other files to install.
+### Windows
+Run `Festival Extractor.exe` (`FestivalExtractor-Windows-x64.zip`).
+
+### macOS
+Use `FestivalExtractor-macOS-AppleSilicon.zip` for M1/M2/M3/M4 Macs or `FestivalExtractor-macOS-Intel.zip` for Intel Macs.
+The app isn't signed by Apple, so the first time **right-click `Festival Extractor` → Open → Open**.
+If macOS says the app is damaged, run `xattr -cr "/path/to/Festival Extractor.app"` in Terminal once.
+
+### Linux
+Unzip `FestivalExtractor-Linux-x64.zip` and run `./"Festival Extractor"`.
 
 ### Build from source
 ```
 pip install -r requirements.txt pyinstaller
 pyinstaller FFR.spec
 ```
-The exe is written to `dist/`. To run without building: `python FFR.py`.
+The program is written to `dist/`. To run without building: `python FFR.py`.
 
 ## 🎛 Usage
 1. Launch **Fortnite Festival Extractor**
