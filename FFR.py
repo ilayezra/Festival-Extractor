@@ -23,7 +23,10 @@ import zipfile
 import tarfile
 import stat
 import pygame
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
+from concurrent.futures import ThreadPoolExecutor
+import struct
+import math
 import time
 import random
 
@@ -922,244 +925,233 @@ class FortniteTracksGUI:
                 offset += 0x34
         return None
 
-    def download_file(self, url, out_path):
-        r = requests.get(url, stream=True)
-        r.raise_for_status()
-        with open(out_path, 'wb') as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
+    def get_keys_path(self):
+        """Find keys.bin next to the program, inside the bundled exe, or in the working folder"""
+        folders = []
+        if getattr(sys, 'frozen', False):
+            folders += [os.path.dirname(sys.executable), sys._MEIPASS]
+        else:
+            folders.append(os.path.dirname(os.path.abspath(__file__)))
+        folders.append(os.getcwd())
+
+        for folder in folders:
+            keys_path = os.path.join(folder, 'keys.bin')
+            if os.path.exists(keys_path):
+                return keys_path
+        raise Exception("keys.bin not found - put it in the same folder as the program")
+
+    def http_get(self, url, byte_range=None, retries=3):
+        """GET a url (optionally only a byte range of it) with a timeout and retries"""
+        headers = {'Range': f"bytes={byte_range[0]}-{byte_range[1]}"} if byte_range else None
+        for attempt in range(1, retries + 1):
+            try:
+                r = requests.get(url, headers=headers, timeout=30)
+                r.raise_for_status()
+                if byte_range and r.status_code == 200:
+                    # Server ignored the Range header and sent the whole file
+                    return r.content[byte_range[0]:byte_range[1] + 1]
+                return r.content
+            except requests.exceptions.RequestException as e:
+                not_found = getattr(e.response, 'status_code', None) == 404
+                if not_found or attempt == retries:
+                    raise
+                time.sleep(2 * attempt)
+
+    def remove_duplicate_path_segments(self, url):
+        """New blurls can repeat a folder in the MPD url (/id/id/master.mpd) - keep only the first one"""
+        parts = urlsplit(url)
+        seen = set()
+        kept = []
+        for segment in parts.path.split('/'):
+            if segment:
+                if segment in seen:
+                    continue
+                seen.add(segment)
+            kept.append(segment)
+        return urlunsplit(parts._replace(path='/'.join(kept)))
+
+    def get_base_url(self, url):
+        parts = urlsplit(url)
+        folder = parts.path.rsplit('/', 1)[0]
+        return f"{parts.scheme}://{parts.netloc}{folder}/"
+
+    def parse_iso_duration(self, value):
+        """Convert an MPD duration like PT3M25.36S into seconds"""
+        match = re.fullmatch(r'P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?)?', value.strip())
+        if not match:
+            return 0
+        days, hours, minutes, seconds = (float(g) if g else 0 for g in match.groups())
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
     def parse_mpd(self, mpd_xml):
+        """Pick the audio track from the MPD and work out how its segments are laid out"""
         root = ET.fromstring(mpd_xml)
-        ns = {'mpd': 'urn:mpeg:dash:schema:mpd:2011'}
-        for period in root.findall('mpd:Period', ns):
-            for adaptation in period.findall('mpd:AdaptationSet', ns):
-                content_type = adaptation.get('contentType')
-                if content_type != 'audio':
-                    continue
-                for representation in adaptation.findall('mpd:Representation', ns):
-                    seg_template = representation.find('mpd:SegmentTemplate', ns)
-                    if seg_template is not None:
-                        init = seg_template.get('initialization')
-                        media = seg_template.get('media')
-                        start_number = int(seg_template.get('startNumber', '1'))
-                        duration = int(seg_template.get('duration'))
-                        timescale = int(seg_template.get('timescale'))
-                        return {
-                            'init': init.replace('$RepresentationID$', representation.get('id')),
-                            'media': media.replace('$RepresentationID$', representation.get('id')),
-                            'start_number': start_number,
-                            'duration': duration,
-                            'timescale': timescale,
-                            'segment_count': None
-                        }
-        raise Exception("No suitable audio segment template found in MPD.")
+        # Drop XML namespaces so the MPD parses whichever namespace Epic uses
+        for element in root.iter():
+            element.tag = element.tag.split('}')[-1]
 
-    def estimate_segment_count(self, mpd_xml, duration, timescale):
-        match = re.search(r'mediaPresentationDuration="PT([\d\.]+)S"', mpd_xml)
-        if match:
-            total_seconds = float(match.group(1))
-            segment_length = duration / timescale
-            estimated_count = int(total_seconds / segment_length + 0.5)
-            return estimated_count
-        return 100  # Keep reasonable fallback
+        period = root.find('Period')
+        adaptations = period.findall('AdaptationSet') if period is not None else []
+        if not adaptations:
+            raise Exception("No AdaptationSet found in MPD")
 
-    def find_actual_segment_count(self, base_url, seg_info, mpd_xml):
-        print("Finding actual segment count...")
-        
-        # Start with MPD estimate
-        estimated_count = self.estimate_segment_count(mpd_xml, seg_info['duration'], seg_info['timescale'])
-        print(f"MPD estimate: {estimated_count} segments")
-        
-        # Always be aggressive - check well beyond the estimate
-        # Use a smart exponential search to find the upper bound quickly
-        return self.exponential_then_binary_search(base_url, seg_info, estimated_count)
-
-    def exponential_then_binary_search(self, base_url, seg_info, estimated_count):
-        """Use exponential search to find upper bound, then binary search for exact count"""
-        
-        # Step 1: Start from the estimate and expand exponentially to find upper bound
-        print("Phase 1: Finding upper bound with exponential search...")
-        
-        # Always start checking from at least the estimate
-        current = estimated_count
-        last_valid = estimated_count
-        step_size = 10  # Start with steps of 10
-        
-        # First, verify our starting point (the estimate) actually works
-        test_seg_num = seg_info['start_number'] + current - 1
-        test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-        
-        try:
-            test_response = requests.head(test_url, timeout=4)
-            if test_response.status_code == 200:
-                last_valid = current
-                print(f"Estimate segment {test_seg_num} exists")
-            else:
-                print(f"Estimate segment {test_seg_num} doesn't exist, searching backwards first...")
-                # If estimate doesn't work, binary search downward
-                return self.binary_search_segments(base_url, seg_info, 1, estimated_count - 1)
-        except:
-            print(f"Failed to check estimate segment, searching backwards...")
-            return self.binary_search_segments(base_url, seg_info, 1, estimated_count - 1)
-        
-        # Step 2: Exponential search upward to find where segments stop existing
-        max_checks = 15  # Limit exponential checks to prevent too much delay
-        checks_done = 0
-        
-        while checks_done < max_checks:
-            current += step_size
-            test_seg_num = seg_info['start_number'] + current - 1
-            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-            
+        def bandwidth(rep):
             try:
-                test_response = requests.head(test_url, timeout=3)
-                if test_response.status_code == 200:
-                    last_valid = current
-                    print(f"Segment {test_seg_num} exists, expanding search...")
-                    step_size = min(step_size * 2, 50)  # Exponentially increase step, but cap at 50
-                else:
-                    print(f"Segment {test_seg_num} doesn't exist, found upper bound around {current}")
-                    break
-            except:
-                print(f"Failed to check segment {test_seg_num}, found upper bound around {current}")
-                break
-                
-            checks_done += 1
-        
-        # If we hit max_checks, we might have a very long song
-        if checks_done >= max_checks:
-            print(f"Hit maximum exponential checks, using upper bound of {current}")
-        
-        # Step 3: Binary search between last_valid and current for exact count
-        print(f"Phase 2: Binary search between {last_valid} and {current}")
-        final_count = self.binary_search_segments(base_url, seg_info, last_valid, current)
-        
-        # Step 4: Final verification - check a few segments after our result
-        print("Phase 3: Final verification...")
-        verified_count = self.verify_and_extend(base_url, seg_info, final_count)
-        
-        return verified_count
+                return int(rep.get('bandwidth', ''))
+            except ValueError:
+                return -1
 
-    def verify_and_extend(self, base_url, seg_info, found_count):
-        """Verify the found count and check a few more segments just to be sure"""
-        
-        # Check the found segment exists
-        test_seg_num = seg_info['start_number'] + found_count - 1
-        test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-        
-        try:
-            test_response = requests.head(test_url, timeout=4)
-            if test_response.status_code != 200:
-                print(f"Warning: Found count {found_count} segment doesn't exist!")
-                return found_count - 1
-        except:
-            print(f"Warning: Cannot verify found count {found_count}")
-            return found_count - 1
-        
-        # Check 5 more segments beyond our found count to be absolutely sure
-        for extra in range(1, 6):
-            test_seg_num = seg_info['start_number'] + found_count + extra - 1
-            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-            
-            try:
-                test_response = requests.head(test_url, timeout=3)
-                if test_response.status_code == 200:
-                    found_count += 1
-                    print(f"Found additional segment {test_seg_num}, new count: {found_count}")
+        for adaptation in adaptations:
+            reps = adaptation.findall('Representation')
+            if not reps:
+                continue
+            # Highest quality representation
+            rep = max(reps, key=bandwidth)
+
+            content_type = (adaptation.get('contentType') or '').strip()
+            if not content_type:
+                mime = (rep.get('mimeType') or adaptation.get('mimeType') or '').lower()
+                content_type = 'video' if 'video/' in mime else 'audio'
+            if content_type != 'audio':
+                continue
+
+            # SegmentTemplate can sit on the Representation or on the AdaptationSet
+            rep_template = rep.find('SegmentTemplate')
+            set_template = adaptation.find('SegmentTemplate')
+
+            def template_attr(name):
+                for template in (rep_template, set_template):
+                    if template is not None and template.get(name):
+                        return template.get(name)
+                return ''
+
+            rep_id = rep.get('id', '')
+            file_name = (rep.findtext('BaseURL') or '').strip()
+            segment_base = rep.find('SegmentBase')
+            init_element = segment_base.find('Initialization') if segment_base is not None else None
+            start_number = template_attr('startNumber')
+
+            return {
+                'init': template_attr('initialization').replace('$RepresentationID$', rep_id) or file_name,
+                'media': template_attr('media').replace('$RepresentationID$', rep_id),
+                'start_number': int(start_number) if start_number.isdigit() else 1,
+                'segment_duration': template_attr('duration'),
+                'timescale': template_attr('timescale'),
+                'track_duration': self.parse_iso_duration(root.get('mediaPresentationDuration', '')),
+                'file_name': file_name,
+                'init_range': init_element.get('range', '') if init_element is not None else '',
+                'index_range': segment_base.get('indexRange', '') if segment_base is not None else '',
+            }
+
+        raise Exception("No audio track found in MPD")
+
+    def get_segment_count(self, seg_info):
+        """Track length / segment length, rounded up"""
+        if not seg_info['segment_duration'] or not seg_info['timescale']:
+            return 1
+        if seg_info['track_duration'] <= 0:
+            raise Exception("Track duration is missing from MPD")
+        segment_seconds = int(seg_info['segment_duration']) / int(seg_info['timescale'])
+        return math.ceil(seg_info['track_duration'] / segment_seconds)
+
+    def segment_name(self, media_template, number):
+        # Supports both $Number$ and padded $Number%05d$
+        return re.sub(r'\$Number(?:%0(\d+)d)?\$', lambda m: str(number).zfill(int(m.group(1) or 0)), media_template)
+
+    def parse_byte_range(self, value):
+        start, end = (int(part) for part in value.strip().split('-'))
+        if start < 0 or end < start:
+            raise Exception(f"Invalid byte range in MPD: {value}")
+        return start, end
+
+    def parse_sidx(self, data):
+        """Find the sidx box and return (box offset in data, box size, first offset, segment sizes)"""
+        i = 0
+        while i + 8 <= len(data):
+            box_size, box_type = struct.unpack('>I4s', data[i:i + 8])
+            header = 8
+            if box_size == 1:
+                box_size = struct.unpack('>Q', data[i + 8:i + 16])[0]
+                header = 16
+            if box_size < header or i + box_size > len(data):
+                raise Exception("Invalid box in MPD index range")
+
+            if box_type == b'sidx':
+                pos = i + header
+                version = data[pos]
+                pos += 4 + 8  # version/flags, reference_ID, timescale
+                if version == 0:
+                    first_offset = struct.unpack('>I', data[pos + 4:pos + 8])[0]
+                    pos += 8
                 else:
+                    first_offset = struct.unpack('>Q', data[pos + 8:pos + 16])[0]
+                    pos += 16
+                reference_count = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+                pos += 4
+                sizes = [struct.unpack('>I', data[pos + 12 * n:pos + 12 * n + 4])[0] & 0x7FFFFFFF
+                         for n in range(reference_count)]
+                return i, box_size, first_offset, sizes
+
+            i += box_size
+        raise Exception("sidx box not found in MPD index range")
+
+    def build_download_list(self, base_url, seg_info):
+        """Return the init download and the media downloads, each as (url, byte_range)"""
+        if seg_info['media']:
+            # Numbered segment files
+            first = seg_info['start_number']
+            count = self.get_segment_count(seg_info)
+            segments = [(base_url + self.segment_name(seg_info['media'], n), None) for n in range(first, first + count)]
+            return (base_url + seg_info['init'], None), segments
+
+        if seg_info['file_name'] and seg_info['init_range'] and seg_info['index_range']:
+            # One file addressed by byte ranges, the segment sizes come from its sidx box
+            file_url = base_url + seg_info['file_name']
+            index_start, index_end = self.parse_byte_range(seg_info['index_range'])
+            box_offset, box_size, first_offset, sizes = self.parse_sidx(self.http_get(file_url, (index_start, index_end)))
+            position = index_start + box_offset + box_size + first_offset
+            segments = []
+            for size in sizes:
+                if size <= 0:
                     break
-            except:
-                break
-        
-        print(f"Final verified segment count: {found_count}")
-        return found_count
-    
-    def aggressive_search_from_high(self, base_url, seg_info, start_estimate):
-        """Start from a high estimate and work backwards to find the true end"""
-        print(f"Starting aggressive search from segment {start_estimate}")
-        
-        # First, find a reasonable upper bound by going even higher
-        upper_bound = start_estimate
-        while upper_bound < start_estimate + 100:  # Limit to prevent infinite searching
-            test_seg_num = seg_info['start_number'] + upper_bound - 1
-            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-            
+                segments.append((file_url, (position, position + size - 1)))
+                position += size
+            return (file_url, self.parse_byte_range(seg_info['init_range'])), segments
+
+        if seg_info['init']:
+            # Whole track is a single file
+            return (base_url + seg_info['init'], None), []
+
+        raise Exception("MPD has no downloadable audio")
+
+    def download_segments(self, segments, numbered, out):
+        """Download segments 5 at a time and append them to out in order"""
+        total = len(segments)
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [pool.submit(self.http_get, url, byte_range) for url, byte_range in segments]
             try:
-                test_response = requests.head(test_url, timeout=4)
-                if test_response.status_code == 200:
-                    print(f"Segment {test_seg_num} exists, expanding search...")
-                    upper_bound += 20  # Jump by larger chunks
-                else:
-                    print(f"Found upper bound at segment {upper_bound}")
-                    break
-            except:
-                print(f"Found upper bound at segment {upper_bound}")
-                break
-        
-        # Now binary search between start_estimate and upper_bound
-        return self.binary_search_segments(base_url, seg_info, start_estimate, upper_bound)
-    
-    def standard_segment_search(self, base_url, seg_info, estimated_count):
-        """Standard search for songs under 3:58"""
-        test_seg_num = seg_info['start_number'] + estimated_count - 1
-        test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-        
-        try:
-            test_response = requests.head(test_url, timeout=5)
-            if test_response.status_code == 200:
-                # Estimate was correct or too low, check a few more
-                print(f"Segment {test_seg_num} exists, checking for additional segments...")
-                for extra in range(1, 21):  # Check up to 20 more
-                    test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num + extra))
+                missing_from = None
+                for done, future in enumerate(futures, 1):
                     try:
-                        test_response = requests.head(test_url, timeout=3)
-                        if test_response.status_code != 200:
-                            final_count = estimated_count + extra - 1
-                            print(f"Found actual segment count: {final_count}")
-                            return final_count
-                    except:
-                        final_count = estimated_count + extra - 1
-                        print(f"Found actual segment count: {final_count}")
-                        return final_count
-                # If all 20 extra segments exist, there might be more
-                return estimated_count + 20
-            else:
-                # Estimate was too high, binary search downward
-                print(f"Segment {test_seg_num} doesn't exist, searching backwards...")
-                return self.binary_search_segments(base_url, seg_info, 1, estimated_count)
-                
-        except Exception as e:
-            print(f"Error testing segments: {e}")
-            return estimated_count
+                        data = future.result()
+                    except requests.exceptions.RequestException as e:
+                        # The MPD length can overshoot, so missing numbered segments are fine at the end only
+                        if numbered and done > 1 and getattr(e.response, 'status_code', None) == 404:
+                            missing_from = missing_from or done
+                            continue
+                        raise Exception(f"Failed to download segment {done}/{total}: {e}")
+                    if missing_from:
+                        raise Exception(f"Segment {missing_from}/{total} is missing")
 
-    def binary_search_segments(self, base_url, seg_info, low_count, high_count):
-        """Efficiently find the actual segment count using binary search"""
-        print(f"Binary searching segments between {low_count} and {high_count}")
-        
-        low = low_count
-        high = high_count
-        last_valid = low_count
-        
-        while low <= high:
-            mid = (low + high) // 2
-            test_seg_num = seg_info['start_number'] + mid - 1
-            test_url = base_url + seg_info['media'].replace('$Number$', str(test_seg_num))
-            
-            try:
-                test_response = requests.head(test_url, timeout=4)
-                if test_response.status_code == 200:
-                    last_valid = mid
-                    low = mid + 1
-                else:
-                    high = mid - 1
-            except:
-                high = mid - 1
-        
-        print(f"Binary search found segment count: {last_valid}")
-        return last_valid
+                    out.write(data)
+                    self.update_progress(10 + int(done / total * 60))
+                    self.update_status(f"Downloading... {done}/{total} chunks")
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                raise
 
-    def convert_blurl_to_mp4(self, blurl_file, total_segments):
+    def convert_blurl_to_mp4(self, blurl_file):
         try:
             self.update_status("Loading song data...")
             self.update_progress(5)
@@ -1167,89 +1159,54 @@ class FortniteTracksGUI:
             blurl = self.decompress_blurl(blurl_file)
             print("BLURL loaded.")
 
-            media_url = blurl['playlists'][0]['url']
+            playlists = blurl.get('playlists') or []
+            if not playlists:
+                raise Exception("No playlists found in BLURL")
+            media_url = self.remove_duplicate_path_segments(playlists[0]['url'])
             print("Media URL:", media_url)
 
+            key_hex = None
             if blurl.get('ev'):
                 nonce, key = self.parse_envelope(blurl['ev'])
-                dec_key = self.get_encryption_key('keys.bin', nonce, key)
+                dec_key = self.get_encryption_key(self.get_keys_path(), nonce, key)
                 if not dec_key:
-                    print("Failed to get decryption key.")
-                    return
+                    raise Exception("No matching decryption key found in keys.bin")
                 key_hex = dec_key.hex()
                 print("Decryption key:", key_hex)
-            else:
-                key_hex = None
 
-            r = requests.get(media_url)
-            r.raise_for_status()
-            mpd_xml = r.text
-
-            try:
-                seg_info = self.parse_mpd(mpd_xml)
-            except Exception as e:
-                print("MPD parsing failed:", e)
-                return
-
-            base_url = '/'.join(media_url.split('/')[:-1]) + '/'
-            
-            # Find actual segment count
-            actual_count = self.find_actual_segment_count(base_url, seg_info, mpd_xml)
-            # Verify the count is accurate
-            seg_info['segment_count'] = actual_count
-            print(f"Will download {seg_info['segment_count']} segments.")
+            seg_info = self.parse_mpd(self.http_get(media_url))
+            init_download, segments = self.build_download_list(self.get_base_url(media_url), seg_info)
+            print(f"Will download {len(segments)} segments.")
 
             self.update_status("Starting download...")
             self.update_progress(10)
 
             os.makedirs('downloads', exist_ok=True)
-
-            init_path = os.path.join('downloads', 'init.mp4')
-            self.download_file(base_url + seg_info['init'], init_path)
             output_path = os.path.join('downloads', 'track.mp4')
-            
             with open(output_path, 'wb') as out:
-                with open(init_path, 'rb') as f:
-                    out.write(f.read())
-                os.remove(init_path)
-
-                for i in range(seg_info['start_number'], seg_info['start_number'] + seg_info['segment_count']):
-                    seg_url = base_url + seg_info['media'].replace('$Number$', str(i))
-                    seg_path = os.path.join('downloads', f'segment_{i}.m4s')
-                    try:
-                        self.download_file(seg_url, seg_path)
-                        with open(seg_path, 'rb') as segf:
-                            out.write(segf.read())
-                        os.remove(seg_path)
-                        print(f"Downloaded and appended segment {i}")
-                        
-                        # Calculate progress: 10% to 70% for downloading segments
-                        segments_done = i - seg_info['start_number'] + 1
-                        download_progress = 10 + int((segments_done / seg_info['segment_count']) * 60)
-                        self.update_progress(download_progress)
-                        self.update_status(f"Downloading... {segments_done}/{seg_info['segment_count']} chunks")
-                        
-                    except Exception as e:
-                        print(f"Failed to download segment {i}: {e}")
-                        break
+                out.write(self.http_get(*init_download))
+                self.download_segments(segments, bool(seg_info['media']), out)
 
             self.update_status("Processing audio file...")
             self.update_progress(75)
 
             if key_hex:
                 creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                subprocess.run([
+                result = subprocess.run([
                     self.ffmpeg_path, '-y', '-decryption_key', key_hex,
                     '-i', output_path, '-c', 'copy', 'master_audio.mp4'
-                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=creation_flags)
+                if result.returncode != 0:
+                    raise Exception(f"FFmpeg decryption failed: {result.stderr.decode(errors='ignore')[-300:]}")
             else:
-                os.rename(output_path, 'master_audio.mp4')
+                os.replace(output_path, 'master_audio.mp4')
 
-            shutil.rmtree('downloads', ignore_errors=True)
             print("Done! Output: master_audio.mp4")
 
         except Exception as e:
             raise Exception(f"BLURL conversion failed: {str(e)}")
+        finally:
+            shutil.rmtree('downloads', ignore_errors=True)
 
     def download_song_thread(self, song, is_queue_download=False):
         """Background thread function for downloading"""
@@ -1309,16 +1266,7 @@ class FortniteTracksGUI:
                                         progress = 2 + int((downloaded_size / total_size) * 3)
                                         self.update_progress(progress)
                         
-                        # Get segment count first for accurate progress
-                        blurl = self.decompress_blurl("master.blurl")
-                        media_url = blurl['playlists'][0]['url']
-                        r = requests.get(media_url)
-                        mpd_xml = r.text
-                        seg_info = self.parse_mpd(mpd_xml)
-                        base_url = '/'.join(media_url.split('/')[:-1]) + '/'
-                        actual_count = self.find_actual_segment_count(base_url, seg_info, mpd_xml)
-                        
-                        self.convert_blurl_to_mp4("master.blurl", actual_count)
+                        self.convert_blurl_to_mp4("master.blurl")
                         
                         self.update_status("Creating audio stems...")
                         self.update_progress(80)
@@ -1802,8 +1750,7 @@ class FortniteTracksGUI:
     def extract_audio_stems(self, song_title, artist_name):
         try:
             if not os.path.exists("master_audio.mp4"):
-                self.show_error("master_audio.mp4 not found")
-                return
+                raise Exception("master_audio.mp4 not found")
 
             os.makedirs(self.extract_folder, exist_ok=True)
             sanitized_title = self.sanitize_folder_name(song_title)
@@ -1906,9 +1853,7 @@ class FortniteTracksGUI:
                     subprocess.Popen(["xdg-open", stem_folder])
 
         except subprocess.CalledProcessError as e:
-            self.show_error(f"FFmpeg extraction failed: {str(e)}")
-        except Exception as e:
-            self.show_error(f"Unexpected error during extraction: {str(e)}")
+            raise Exception(f"FFmpeg extraction failed: {str(e)}")
 
 
 if __name__ == "__main__":
