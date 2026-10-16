@@ -13,6 +13,7 @@ import zlib
 import base64
 import hashlib
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 from Crypto.Cipher import AES
 import shutil
 import threading
@@ -983,12 +984,23 @@ class FortniteTracksGUI:
         days, hours, minutes, seconds = (float(g) if g else 0 for g in match.groups())
         return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
+    def parse_xml_without_namespaces(self, data):
+        """Parse XML with namespace handling off (Epic's MPDs declare namespaces ElementTree rejects)"""
+        def local(name):
+            return name.split(':')[-1]
+
+        builder = ET.TreeBuilder()
+        parser = xml.parsers.expat.ParserCreate()
+        parser.StartElementHandler = lambda name, attrs: builder.start(local(name), {
+            local(k): v for k, v in attrs.items() if k != 'xmlns' and not k.startswith('xmlns:')})
+        parser.EndElementHandler = lambda name: builder.end(local(name))
+        parser.CharacterDataHandler = builder.data
+        parser.Parse(data, True)
+        return builder.close()
+
     def parse_mpd(self, mpd_xml):
         """Pick the audio track from the MPD and work out how its segments are laid out"""
-        root = ET.fromstring(mpd_xml)
-        # Drop XML namespaces so the MPD parses whichever namespace Epic uses
-        for element in root.iter():
-            element.tag = element.tag.split('}')[-1]
+        root = self.parse_xml_without_namespaces(mpd_xml)
 
         period = root.find('Period')
         adaptations = period.findall('AdaptationSet') if period is not None else []
